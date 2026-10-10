@@ -21,7 +21,7 @@ func NewInMemory(options Options) (*Runtime, error) {
 	}
 
 	store := memory.NewProposalStore()
-	orders, err := application.NewOrdersService(store, options.OrdersWarehouse, options.Now, options.NewID)
+	orders, err := application.NewOrdersService(store, options.OrdersWarehouse, options.Now, options.NewID, options.OrderAttemptReader)
 	if err != nil {
 		return nil, err
 	}
@@ -36,6 +36,10 @@ func (r *Runtime) PrepareOrder(ctx context.Context, request contract.PrepareOrde
 
 func (r *Runtime) ConfirmOrder(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
 	return r.orders.ConfirmOrder(ctx, request)
+}
+
+func (r *Runtime) ResolveConfirmation(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
+	return r.orders.ResolveConfirmation(ctx, request)
 }
 
 func (r *Runtime) GetProducts(ctx context.Context) (contract.Products, error) {

@@ -7,9 +7,10 @@ import (
 )
 
 type Options struct {
-	Now              func() time.Time
-	NewID            func() string
-	OrdersWarehouse  contract.OrdersWarehouse
-	CatalogWarehouse contract.CatalogWarehouse
-	MenuWarehouse    contract.MenuWarehouse
+	Now                func() time.Time
+	NewID              func() string
+	OrdersWarehouse    contract.OrdersWarehouse
+	OrderAttemptReader contract.OrderAttemptReader
+	CatalogWarehouse   contract.CatalogWarehouse
+	MenuWarehouse      contract.MenuWarehouse
 }

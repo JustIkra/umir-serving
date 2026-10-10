@@ -9,6 +9,10 @@ type OrdersWarehouse interface {
 	FindOrderByProposal(context.Context, string) (Order, bool, error)
 }
 
+type OrderAttemptReader interface {
+	FindOrderAttempt(context.Context, string, string) (OrderAttempt, error)
+}
+
 type CatalogWarehouse interface {
 	GetProducts(context.Context) (Products, error)
 	GetDishCatalog(context.Context) (DishCatalog, error)

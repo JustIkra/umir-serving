@@ -2,6 +2,25 @@ package contract
 
 import "errors"
 
+type OperationError struct {
+	Code    string
+	Message string
+	Outcome string
+	Cause   error
+}
+
+func (e *OperationError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Cause != nil {
+		return e.Cause.Error()
+	}
+	return e.Code
+}
+
+func (e *OperationError) Unwrap() error { return e.Cause }
+
 var (
 	ErrInvalidArgument         = errors.New("invalid argument")
 	ErrInventoryUnavailable    = errors.New("inventory unavailable")

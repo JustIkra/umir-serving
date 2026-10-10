@@ -38,39 +38,31 @@ type warehouseFake struct {
 
 type unavailableProposalStore struct {
 	application.ProposalStore
+	application.ConfirmationAttemptStore
 	err error
 }
 
-type failingResolveProposalStore struct {
+type completeOnceFailureStore struct {
 	application.ProposalStore
-	err error
-}
-
-type resolveOnceFailureStore struct {
-	application.ProposalStore
-	proposalID string
-	err        error
-	mu         sync.Mutex
-	failed     bool
+	application.ConfirmationAttemptStore
+	err    error
+	mu     sync.Mutex
+	failed bool
 }
 
 func (s unavailableProposalStore) Get(context.Context, string) (domain.ProposalRecord, bool, error) {
 	return domain.ProposalRecord{}, false, s.err
 }
 
-func (s failingResolveProposalStore) ResolvePending(context.Context, string, string) error {
-	return s.err
-}
-
-func (s *resolveOnceFailureStore) ResolvePending(ctx context.Context, proposalID, commandID string) error {
+func (s *completeOnceFailureStore) CompleteAttempt(ctx context.Context, commandID string, result contract.ConfirmResult, rejection *contract.AttemptError, replacement *domain.OrderProposal) error {
 	s.mu.Lock()
-	if proposalID == s.proposalID && !s.failed {
+	if !s.failed {
 		s.failed = true
 		s.mu.Unlock()
 		return s.err
 	}
 	s.mu.Unlock()
-	return s.ProposalStore.ResolvePending(ctx, proposalID, commandID)
+	return s.ConfirmationAttemptStore.CompleteAttempt(ctx, commandID, result, rejection, replacement)
 }
 
 type racingCommandWarehouse struct {
@@ -79,7 +71,6 @@ type racingCommandWarehouse struct {
 	initialLookupsReady chan struct{}
 	recorded            map[string]contract.CommandRecord
 	ordersByProposal    map[string]contract.Order
-	firstCommitDone     chan struct{}
 	commitCalls         int
 }
 
@@ -88,7 +79,6 @@ func newRacingCommandWarehouse() *racingCommandWarehouse {
 		initialLookupsReady: make(chan struct{}),
 		recorded:            make(map[string]contract.CommandRecord),
 		ordersByProposal:    make(map[string]contract.Order),
-		firstCommitDone:     make(chan struct{}),
 	}
 }
 
@@ -97,9 +87,6 @@ func (*racingCommandWarehouse) EvaluateOrder(context.Context, contract.EvaluateO
 }
 
 func (w *racingCommandWarehouse) CommitAcceptedOrder(_ context.Context, request contract.CommitOrderRequest) (contract.CommitResult, error) {
-	if request.CommandID == "command-1" && request.ProposalID == "proposal-2" {
-		<-w.firstCommitDone
-	}
 	order := contract.Order{
 		OrderID:    "order-for-" + request.ProposalID,
 		ProposalID: request.ProposalID,
@@ -116,9 +103,6 @@ func (w *racingCommandWarehouse) CommitAcceptedOrder(_ context.Context, request 
 	}
 	w.recorded[request.CommandID] = commandRecord(request.CommandID, request.ProposalID, order)
 	w.ordersByProposal[request.ProposalID] = order
-	if request.CommandID == "command-1" && request.ProposalID == "proposal-1" {
-		close(w.firstCommitDone)
-	}
 	return contract.CommitResult{Kind: contract.OrderCommitted, Order: &order}, nil
 }
 
@@ -233,7 +217,11 @@ func TestPrepareDoesNotReserve(t *testing.T) {
 		RequestedPositions: []contract.Position{{LineNo: 1, DishID: "dish-1", Portions: 2}},
 		AcceptedPositions:  []contract.AcceptedPosition{{LineNo: 1, DishID: "dish-1", Portions: 2}},
 	}
-	service := newOrdersService(t, store, warehouse)
+	ids := testsupport.NewIDs("generated-proposal-")
+	service, err := application.NewOrdersService(store, warehouse, func() time.Time { return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow) }, ids.Next)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	proposal, err := service.PrepareOrder(context.Background(), contract.PrepareOrderRequest{
 		Positions: []contract.Position{{DishID: "dish-1", Portions: 2}},
@@ -393,6 +381,122 @@ func TestConfirmLostResponse(t *testing.T) {
 	}
 }
 
+func TestMismatchedCommittedPayloadStaysUnknownAndPassiveLookupRecovers(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 2))
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	warehouse.commitHook = func(request contract.CommitOrderRequest) (contract.CommitResult, error) {
+		malformed := order
+		malformed.Positions = []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}
+		warehouse.mu.Lock()
+		warehouse.recorded[request.CommandID] = commandRecord(request.CommandID, request.ProposalID, order)
+		warehouse.mu.Unlock()
+		return contract.CommitResult{Kind: contract.OrderCommitted, Order: &malformed}, nil
+	}
+	service := newOrdersService(t, store, warehouse)
+	first, firstErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	var operationError *contract.OperationError
+	if !errors.As(firstErr, &operationError) || operationError.Outcome != "unknown" || first.Kind != "" {
+		t.Fatalf("first ConfirmOrder() = (%+v,%v), want unknown malformed result", first, firstErr)
+	}
+	attempt, found, attemptErr := store.GetAttempt(context.Background(), "command-1")
+	if attemptErr != nil || !found || attempt.State != contract.OrderAttemptPending || attempt.WarehouseResult != nil {
+		t.Fatalf("attempt after malformed result = (%+v,%v,%v)", attempt, found, attemptErr)
+	}
+	second, secondErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if secondErr != nil || second.Kind != contract.OrderConfirmed || second.Order == nil || second.Order.OrderID != "order-1" {
+		t.Fatalf("passive recorded lookup = (%+v,%v)", second, secondErr)
+	}
+	_, calls := warehouse.commits()
+	if calls != 1 {
+		t.Fatalf("commit calls = %d, want one", calls)
+	}
+}
+
+func TestEmptyOrderBindsCommandAcrossProposals(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 0))
+	createProposal(t, store, proposalFixture("proposal-2", 2))
+	service := newOrdersService(t, store, warehouse)
+
+	first, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if err != nil || first.Kind != contract.EmptyOrder {
+		t.Fatalf("ConfirmOrder(P1) = (%+v, %v), want EmptyOrder", first, err)
+	}
+	second, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-2"})
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) || second.Kind != "" {
+		t.Fatalf("ConfirmOrder(P2) = (%+v, %v), want global command identity conflict", second, err)
+	}
+	_, calls := warehouse.commits()
+	if calls != 0 {
+		t.Fatalf("empty order/reused ID reached warehouse %d times", calls)
+	}
+	original, found, err := store.GetAttempt(context.Background(), "command-1")
+	if err != nil || !found || original.ProposalID != "proposal-1" || original.State != contract.OrderAttemptCompleted {
+		t.Fatalf("original attempt = (%+v, %v, %v), want completed P1 binding", original, found, err)
+	}
+}
+
+func TestConcurrentCrossProposalCommandBindingHasOneWinner(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 0))
+	createProposal(t, store, proposalFixture("proposal-2", 0))
+	service := newOrdersService(t, store, warehouse)
+	type response struct {
+		proposalID string
+		result     contract.ConfirmResult
+		err        error
+	}
+	responses := make(chan response, 2)
+	for _, proposalID := range []string{"proposal-1", "proposal-2"} {
+		proposalID := proposalID
+		go func() {
+			result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: proposalID})
+			responses <- response{proposalID: proposalID, result: result, err: err}
+		}()
+	}
+	first, second := <-responses, <-responses
+	results := map[string]response{first.proposalID: first, second.proposalID: second}
+	winners := 0
+	for _, value := range results {
+		if value.result.Kind == contract.EmptyOrder && value.err == nil {
+			winners++
+		} else if !errors.Is(value.err, contract.ErrCommandIdentityConflict) {
+			t.Fatalf("cross-proposal result = (%+v,%v), want EmptyOrder or identity conflict", value.result, value.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("completed winners = %d, want exactly one", winners)
+	}
+	_, commits := warehouse.commits()
+	if commits != 0 {
+		t.Fatalf("empty cross-proposal command made %d commits", commits)
+	}
+}
+
+func TestRecordedWarehouseIdentityCannotBePoisonedByFreshServingBinding(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-true", Positions: []contract.AcceptedPosition{{LineNo: 1, DishID: "dish-1", Portions: 1}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-true", order)
+	service := newOrdersService(t, store, warehouse)
+	wrong, wrongErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-fake"})
+	if !errors.Is(wrongErr, contract.ErrCommandIdentityConflict) || wrong.Kind != "" {
+		t.Fatalf("wrong proposal ConfirmOrder() = (%+v,%v), want identity conflict", wrong, wrongErr)
+	}
+	correct, correctErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-true"})
+	if correctErr != nil || correct.Kind != contract.OrderConfirmed || correct.Order == nil || correct.Order.OrderID != "order-1" {
+		t.Fatalf("correct replay = (%+v,%v), want original recorded order", correct, correctErr)
+	}
+	_, commitCalls := warehouse.commits()
+	if commitCalls != 0 {
+		t.Fatalf("recorded replay called commit %d times", commitCalls)
+	}
+}
+
 func TestDifferentCommandWhilePending(t *testing.T) {
 	store := memory.NewProposalStore()
 	warehouse := newWarehouseFake()
@@ -475,8 +579,16 @@ func TestProposalLookupWithDifferentCommandResolvesOriginalPending(t *testing.T)
 		t.Fatalf("ConfirmOrder() = (%+v, %v), want proposal's recorded order", result, err)
 	}
 	record, ok, getErr := store.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "command-1" {
+		t.Fatalf("C2 read changed the original attempt marker: (%+v, %v, %v)", record, ok, getErr)
+	}
+	original, retryErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if retryErr != nil || original.Kind != contract.OrderConfirmed || original.Order == nil || original.Order.OrderID != "order-1" {
+		t.Fatalf("original C1 retry = (%+v, %v)", original, retryErr)
+	}
+	record, ok, getErr = store.Get(context.Background(), "proposal-1")
 	if getErr != nil || !ok || record.PendingCommandID != "" {
-		t.Fatalf("C2 proposal recovery left original pending state: (%+v, %v, %v)", record, ok, getErr)
+		t.Fatalf("C1 atomic completion left marker: (%+v, %v, %v)", record, ok, getErr)
 	}
 	_, calls := warehouse.commits()
 	if calls != 0 {
@@ -501,7 +613,8 @@ func TestRecordedOrderReturnsWhenProposalStoreIsUnavailable(t *testing.T) {
 	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
 	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
 	storeErr := errors.New("temporary proposal store outage")
-	store := unavailableProposalStore{ProposalStore: memory.NewProposalStore(), err: storeErr}
+	baseStore := memory.NewProposalStore()
+	store := unavailableProposalStore{ProposalStore: baseStore, ConfirmationAttemptStore: baseStore, err: storeErr}
 	service := newOrdersService(t, store, warehouse)
 
 	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
@@ -514,14 +627,13 @@ func TestRecordedOrderReturnsWhenProposalStoreIsUnavailable(t *testing.T) {
 	}
 }
 
-func TestRecordedOrderRemainsAuthoritativeWhenPendingResolutionFails(t *testing.T) {
+func TestRecordedOrderAtomicallyCompletesMatchingPendingMarker(t *testing.T) {
 	baseStore := memory.NewProposalStore()
 	createProposal(t, baseStore, proposalFixture("proposal-1", 2))
 	if err := baseStore.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
 		t.Fatal(err)
 	}
-	storeErr := errors.New("temporary pending resolution failure")
-	store := failingResolveProposalStore{ProposalStore: baseStore, err: storeErr}
+	store := baseStore
 	warehouse := newWarehouseFake()
 	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
 	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
@@ -529,19 +641,19 @@ func TestRecordedOrderRemainsAuthoritativeWhenPendingResolutionFails(t *testing.
 
 	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
 	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
-		t.Fatalf("ConfirmOrder() = (%+v, %v), want recorded order despite cleanup error %v", result, err, storeErr)
+		t.Fatalf("ConfirmOrder() = (%+v, %v), want recorded order", result, err)
 	}
 	record, ok, getErr := baseStore.Get(context.Background(), "proposal-1")
-	if getErr != nil || !ok || record.PendingCommandID != "command-1" {
-		t.Fatalf("pending state after failed best-effort cleanup = (%+v, %v, %v), want unchanged pending command", record, ok, getErr)
+	if getErr != nil || !ok || record.PendingCommandID != "" {
+		t.Fatalf("pending state after atomic completion = (%+v, %v, %v), want empty", record, ok, getErr)
 	}
 }
 
-func TestCommittedOrderRemainsAuthoritativeWhenImmediateCleanupFails(t *testing.T) {
+func TestCommittedOrderRemainsAuthoritativeWhenLocalCompletionFails(t *testing.T) {
 	baseStore := memory.NewProposalStore()
 	createProposal(t, baseStore, proposalFixture("proposal-1", 2))
-	storeErr := errors.New("temporary pending resolution failure")
-	store := &resolveOnceFailureStore{ProposalStore: baseStore, proposalID: "proposal-1", err: storeErr}
+	storeErr := errors.New("temporary local completion failure")
+	store := &completeOnceFailureStore{ProposalStore: baseStore, ConfirmationAttemptStore: baseStore, err: storeErr}
 	warehouse := newWarehouseFake()
 	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
 	warehouse.commitHook = func(request contract.CommitOrderRequest) (contract.CommitResult, error) {
@@ -555,12 +667,17 @@ func TestCommittedOrderRemainsAuthoritativeWhenImmediateCleanupFails(t *testing.
 	request := contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"}
 
 	first, err := service.ConfirmOrder(context.Background(), request)
-	if err != nil || first.Kind != contract.OrderConfirmed || first.Order == nil || first.Order.OrderID != order.OrderID {
-		t.Fatalf("first ConfirmOrder() = (%+v, %v), want committed order despite cleanup error %v", first, err, storeErr)
+	var operationError *contract.OperationError
+	if !errors.As(err, &operationError) || operationError.Outcome != "unknown" || first.Kind != "" {
+		t.Fatalf("first ConfirmOrder() = (%+v, %v), want unknown after local completion error %v", first, err, storeErr)
+	}
+	attempt, found, attemptErr := baseStore.GetAttempt(context.Background(), "command-1")
+	if attemptErr != nil || !found || attempt.State != contract.OrderAttemptPending || attempt.WarehouseResult == nil || attempt.WarehouseResult.Kind != contract.OrderCommitted {
+		t.Fatalf("attempt after local completion failure = (%+v,%v,%v)", attempt, found, attemptErr)
 	}
 	record, ok, getErr := baseStore.Get(context.Background(), "proposal-1")
 	if getErr != nil || !ok || record.PendingCommandID != "command-1" {
-		t.Fatalf("pending marker after failed cleanup = (%+v, %v, %v), want command-1", record, ok, getErr)
+		t.Fatalf("pending marker after failed completion = (%+v, %v, %v), want command-1", record, ok, getErr)
 	}
 
 	second, err := service.ConfirmOrder(context.Background(), request)
@@ -569,7 +686,7 @@ func TestCommittedOrderRemainsAuthoritativeWhenImmediateCleanupFails(t *testing.
 	}
 	record, ok, getErr = baseStore.Get(context.Background(), "proposal-1")
 	if getErr != nil || !ok || record.PendingCommandID != "" {
-		t.Fatalf("pending marker after successful retry cleanup = (%+v, %v, %v), want empty", record, ok, getErr)
+		t.Fatalf("pending marker after successful local completion = (%+v, %v, %v), want empty", record, ok, getErr)
 	}
 	_, calls := warehouse.commits()
 	if calls != 1 {
@@ -608,6 +725,69 @@ func TestCancelledAfterWarehouseCommit(t *testing.T) {
 	_, calls := warehouse.commits()
 	if calls != 1 {
 		t.Fatalf("retry after cancellation called CommitAcceptedOrder %d times", calls)
+	}
+}
+
+func TestContextCancellationAfterKnownCommitStillCompletesLocally(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 2))
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	warehouse.commitHook = func(request contract.CommitOrderRequest) (contract.CommitResult, error) {
+		warehouse.mu.Lock()
+		warehouse.recorded[request.CommandID] = commandRecord(request.CommandID, request.ProposalID, order)
+		warehouse.mu.Unlock()
+		cancel()
+		return contract.CommitResult{Kind: contract.OrderCommitted, Order: &order}, nil
+	}
+	service := newOrdersService(t, store, warehouse)
+	result, err := service.ConfirmOrder(ctx, contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil {
+		t.Fatalf("ConfirmOrder() = (%+v,%v), want locally completed known order", result, err)
+	}
+	attempt, found, attemptErr := store.GetAttempt(context.Background(), "command-1")
+	if attemptErr != nil || !found || attempt.State != contract.OrderAttemptCompleted {
+		t.Fatalf("attempt after cancellation = (%+v,%v,%v)", attempt, found, attemptErr)
+	}
+	_, calls := warehouse.commits()
+	if calls != 1 {
+		t.Fatalf("commit calls = %d, want one", calls)
+	}
+}
+
+func TestReplacementIDFailurePreservesKnownWarehouseResultForRetry(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 2))
+	warehouse.commitResult = contract.CommitResult{Kind: contract.RecheckRequired, OrderEvaluation: &contract.OrderEvaluation{EvaluatedAt: time.Date(2026, time.October, 11, 12, 0, 0, 0, testsupport.Moscow), StateVersion: 8, AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}, Changes: []contract.Change{}}}
+	idCalls := 0
+	service, err := application.NewOrdersService(store, warehouse, func() time.Time { return time.Date(2026, time.October, 11, 12, 0, 0, 0, testsupport.Moscow) }, func() string {
+		idCalls++
+		if idCalls == 1 {
+			return ""
+		}
+		return "replacement-1"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, firstErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	var operationError *contract.OperationError
+	if !errors.As(firstErr, &operationError) || operationError.Outcome != "unknown" || first.Kind != "" {
+		t.Fatalf("first ConfirmOrder() = (%+v,%v), want unknown retained result", first, firstErr)
+	}
+	attempt, found, attemptErr := store.GetAttempt(context.Background(), "command-1")
+	if attemptErr != nil || !found || attempt.WarehouseResult == nil || attempt.WarehouseResult.Kind != contract.RecheckRequired {
+		t.Fatalf("attempt = (%+v,%v,%v), want saved recheck", attempt, found, attemptErr)
+	}
+	second, secondErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if secondErr != nil || second.Kind != contract.RequiresConfirmation || second.Proposal == nil || second.Proposal.ProposalID != "replacement-1" {
+		t.Fatalf("retry = (%+v,%v)", second, secondErr)
+	}
+	_, calls := warehouse.commits()
+	if calls != 1 {
+		t.Fatalf("warehouse commit calls = %d, want one", calls)
 	}
 }
 
@@ -789,7 +969,7 @@ func TestKnownInvalidArgumentClearsPendingAndAllowsNewCommand(t *testing.T) {
 
 	warehouse.mu.Lock()
 	warehouse.commitErr = nil
-	warehouse.commitResult = contract.CommitResult{Kind: contract.OrderCommitted, Order: &contract.Order{OrderID: "order-1", ProposalID: "proposal-1"}}
+	warehouse.commitResult = contract.CommitResult{Kind: contract.OrderCommitted, Order: &contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}}}
 	warehouse.mu.Unlock()
 	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
 	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
@@ -801,18 +981,16 @@ func TestKnownInvalidArgumentClearsPendingAndAllowsNewCommand(t *testing.T) {
 	}
 }
 
-func TestConflictingCommandRaceReconcilesPendingForNextCommand(t *testing.T) {
+func TestConcurrentCrossProposalReuseReservesOneGlobalCommand(t *testing.T) {
 	baseStore := memory.NewProposalStore()
 	createProposal(t, baseStore, proposalFixture("proposal-1", 1))
 	createProposal(t, baseStore, proposalFixture("proposal-2", 1))
-	storeErr := errors.New("temporary pending resolution failure")
-	store := &resolveOnceFailureStore{ProposalStore: baseStore, proposalID: "proposal-2", err: storeErr}
+	store := baseStore
 	warehouse := newRacingCommandWarehouse()
-	service, err := application.NewOrdersService(store, warehouse, func() time.Time {
-		return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow)
-	}, testsupport.NewIDs("generated-proposal-").Next)
+	ids := testsupport.NewIDs("generated-proposal-")
+	service, err := application.NewOrdersService(store, warehouse, func() time.Time { return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow) }, ids.Next)
 	if err != nil {
-		t.Fatalf("NewOrdersService() error = %v", err)
+		t.Fatal(err)
 	}
 
 	type response struct {
@@ -831,34 +1009,43 @@ func TestConflictingCommandRaceReconcilesPendingForNextCommand(t *testing.T) {
 	first := <-responses
 	second := <-responses
 	results := map[string]response{first.proposalID: first, second.proposalID: second}
-	if got := results["proposal-1"]; got.err != nil || got.result.Kind != contract.OrderConfirmed {
-		t.Fatalf("proposal-1 C1 result = (%+v, %v), want committed order", got.result, got.err)
+	winner := ""
+	for proposalID, value := range results {
+		if value.err == nil && value.result.Kind == contract.OrderConfirmed {
+			winner = proposalID
+			continue
+		}
+		if !errors.Is(value.err, contract.ErrCommandIdentityConflict) {
+			t.Fatalf("%s C1 result = (%+v,%v), want committed order or identity conflict", proposalID, value.result, value.err)
+		}
 	}
-	if got := results["proposal-2"]; !errors.Is(got.err, contract.ErrCommandIdentityConflict) {
-		t.Fatalf("proposal-2 C1 error = %v, want ErrCommandIdentityConflict (cleanup may also fail with %v)", got.err, storeErr)
+	if winner == "" {
+		t.Fatal("neither proposal completed command-1")
 	}
-	record, ok, getErr := baseStore.Get(context.Background(), "proposal-2")
-	if getErr != nil || !ok || record.PendingCommandID != "command-1" {
-		t.Fatalf("proposal-2 pending marker after failed cleanup = (%+v, %v, %v), want command-1", record, ok, getErr)
+	loser := "proposal-1"
+	if winner == loser {
+		loser = "proposal-2"
 	}
-
-	if _, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-2"}); !errors.Is(err, contract.ErrCommandIdentityConflict) {
-		t.Fatalf("proposal-2 conflicting C1 retry error = %v, want ErrCommandIdentityConflict", err)
+	attempt, found, attemptErr := baseStore.GetAttempt(context.Background(), "command-1")
+	if attemptErr != nil || !found || attempt.ProposalID != winner || attempt.State != contract.OrderAttemptCompleted {
+		t.Fatalf("global C1 binding = (%+v,%v,%v), winner=%s", attempt, found, attemptErr, winner)
 	}
-	record, ok, getErr = baseStore.Get(context.Background(), "proposal-2")
+	record, ok, getErr := baseStore.Get(context.Background(), loser)
 	if getErr != nil || !ok || record.PendingCommandID != "" {
-		t.Fatalf("proposal-2 marker after known-conflict reconciliation = (%+v, %v, %v), want empty", record, ok, getErr)
+		t.Fatalf("losing proposal pending state = (%+v,%v,%v)", record, ok, getErr)
 	}
-
-	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-2"})
-	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.ProposalID != "proposal-2" {
-		t.Fatalf("proposal-2 C2 retry = (%+v, %v), want its committed order", result, err)
+	if _, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: loser}); !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("losing C1 retry error = %v", err)
+	}
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: loser})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.ProposalID != loser {
+		t.Fatalf("losing proposal C2 = (%+v,%v)", result, err)
 	}
 	warehouse.mu.Lock()
 	commitCalls := warehouse.commitCalls
 	warehouse.mu.Unlock()
-	if commitCalls != 3 {
-		t.Fatalf("warehouse commit calls = %d, want P1/C1, P2/C1, P2/C2", commitCalls)
+	if commitCalls != 2 {
+		t.Fatalf("warehouse commit calls = %d, want one winner and one new loser command", commitCalls)
 	}
 }
 
@@ -880,8 +1067,20 @@ func TestReplacementSaveFailureLeavesOldProposalActive(t *testing.T) {
 		t.Fatalf("ConfirmOrder() = (%+v, %v), want replacement save error", result, err)
 	}
 	old, ok, getErr := store.Get(context.Background(), "proposal-1")
-	if getErr != nil || !ok || old.SupersededBy != "" || old.PendingCommandID != "" {
+	if getErr != nil || !ok || old.SupersededBy != "" || old.PendingCommandID != "command-1" {
 		t.Fatalf("old proposal after failed replacement = (%+v, %v, %v)", old, ok, getErr)
+	}
+	attempt, found, attemptErr := store.GetAttempt(context.Background(), "command-1")
+	if attemptErr != nil || !found || attempt.State != contract.OrderAttemptPending || attempt.WarehouseResult == nil || attempt.WarehouseResult.Kind != contract.RecheckRequired {
+		t.Fatalf("attempt after failed local completion = (%+v, %v, %v), want pending with known RecheckRequired", attempt, found, attemptErr)
+	}
+	retry, retryErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if retryErr != nil || retry.Kind != contract.RequiresConfirmation || retry.Proposal == nil || retry.Proposal.ProposalID == "generated-proposal-1" {
+		t.Fatalf("retry after known result = (%+v, %v), want saved result with a non-colliding replacement", retry, retryErr)
+	}
+	_, commitCalls := warehouse.commits()
+	if commitCalls != 1 {
+		t.Fatalf("local completion retry called warehouse %d times, want one", commitCalls)
 	}
 }
 

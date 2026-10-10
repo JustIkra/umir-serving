@@ -15,12 +15,14 @@ import (
 )
 
 type OrdersService struct {
-	store     ProposalStore
-	warehouse contract.OrdersWarehouse
-	now       func() time.Time
-	newID     func() string
-	locksMu   sync.Mutex
-	locks     map[string]*proposalLock
+	store         ProposalStore
+	attempts      ConfirmationAttemptStore
+	warehouse     contract.OrdersWarehouse
+	attemptReader contract.OrderAttemptReader
+	now           func() time.Time
+	newID         func() string
+	locksMu       sync.Mutex
+	locks         map[string]*proposalLock
 }
 
 type proposalLock struct {
@@ -28,17 +30,26 @@ type proposalLock struct {
 	refs int
 }
 
-func NewOrdersService(store ProposalStore, warehouse contract.OrdersWarehouse, now func() time.Time, newID func() string) (*OrdersService, error) {
-	if store == nil || warehouse == nil || now == nil || newID == nil {
+func NewOrdersService(store ProposalStore, warehouse contract.OrdersWarehouse, now func() time.Time, newID func() string, readers ...contract.OrderAttemptReader) (*OrdersService, error) {
+	attempts, ok := store.(ConfirmationAttemptStore)
+	if store == nil || !ok || warehouse == nil || now == nil || newID == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &OrdersService{
+	service := &OrdersService{
 		store:     store,
+		attempts:  attempts,
 		warehouse: warehouse,
 		now:       now,
 		newID:     newID,
 		locks:     make(map[string]*proposalLock),
-	}, nil
+	}
+	if len(readers) > 1 {
+		return nil, contract.ErrInvalidArgument
+	}
+	if len(readers) == 1 {
+		service.attemptReader = readers[0]
+	}
+	return service, nil
 }
 
 func (s *OrdersService) PrepareOrder(ctx context.Context, request contract.PrepareOrderRequest) (contract.OrderProposal, error) {
@@ -72,149 +83,14 @@ func (s *OrdersService) PrepareOrder(ctx context.Context, request contract.Prepa
 }
 
 func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
-	if request.CommandID == "" || request.ProposalID == "" {
-		return contract.ConfirmResult{}, contract.ErrInvalidArgument
-	}
-	unlock := s.lockProposal(request.ProposalID)
-	defer unlock()
-	if err := ctx.Err(); err != nil {
-		return contract.ConfirmResult{}, err
-	}
-	fingerprint, err := confirmOrderFingerprint(request.ProposalID)
-	if err != nil {
-		return contract.ConfirmResult{}, err
-	}
-	recorded, found, err := s.warehouse.FindRecordedCommand(ctx, request.CommandID)
-	if err != nil {
-		return contract.ConfirmResult{}, err
-	}
-	if found {
-		order, err := recordedOrder(recorded, request.CommandID, request.ProposalID, fingerprint)
-		if err != nil {
-			if errors.Is(err, contract.ErrCommandIdentityConflict) {
-				if cleanupErr := s.reconcilePendingCommand(ctx, request.ProposalID, request.CommandID); cleanupErr != nil {
-					return contract.ConfirmResult{}, errors.Join(err, fmt.Errorf("reconcile pending confirmation after command identity conflict: %w", cleanupErr))
-				}
-			}
-			return contract.ConfirmResult{}, err
-		}
-		if cleanupErr := s.reconcilePending(ctx, request.ProposalID); cleanupErr != nil {
-			// Keep the warehouse record authoritative; a later lookup retries cleanup.
-			return confirmed(order), nil
-		}
-		return confirmed(order), nil
-	}
-	order, found, err := s.warehouse.FindOrderByProposal(ctx, request.ProposalID)
-	if err != nil {
-		return contract.ConfirmResult{}, err
-	}
-	if found {
-		if cleanupErr := s.reconcilePending(ctx, request.ProposalID); cleanupErr != nil {
-			// Keep the warehouse record authoritative; a later lookup retries cleanup.
-			return confirmed(order), nil
-		}
-		return confirmed(order), nil
-	}
-
-	record, found, err := s.store.Get(ctx, request.ProposalID)
-	if err != nil {
-		return contract.ConfirmResult{}, err
-	}
-	if !found {
-		return contract.ConfirmResult{}, contract.ErrProposalNotFound
-	}
-	if record.SupersededBy != "" {
-		return contract.ConfirmResult{Kind: contract.ProposalSuperseded, SupersededBy: record.SupersededBy}, nil
-	}
-	if record.PendingCommandID != "" && record.PendingCommandID != request.CommandID {
-		return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
-	}
-	if len(record.Proposal.AcceptedPositions) == 0 {
-		proposal := toContractProposal(record.Proposal)
-		return contract.ConfirmResult{Kind: contract.EmptyOrder, Proposal: &proposal}, nil
-	}
-	if err := s.store.MarkPending(ctx, request.ProposalID, request.CommandID); err != nil {
-		return contract.ConfirmResult{}, err
-	}
-	commit := contract.CommitOrderRequest{
-		CommandID:         request.CommandID,
-		ProposalID:        request.ProposalID,
-		AcceptedPositions: toContractAcceptedPositions(record.Proposal.AcceptedPositions),
-	}
-	result, err := s.warehouse.CommitAcceptedOrder(ctx, commit)
-	if err != nil {
-		if definiteCommitRejection(err) {
-			if resolveErr := s.store.ResolvePending(context.WithoutCancel(ctx), request.ProposalID, request.CommandID); resolveErr != nil {
-				return contract.ConfirmResult{}, errors.Join(err, fmt.Errorf("resolve pending confirmation after definite warehouse rejection: %w", resolveErr))
-			}
-		}
-		return contract.ConfirmResult{}, err
-	}
-	switch result.Kind {
-	case contract.OrderCommitted:
-		if result.Order == nil || result.Order.ProposalID != request.ProposalID || result.Order.OrderID == "" {
-			return contract.ConfirmResult{}, errors.New("invalid committed order result")
-		}
-		if cleanupErr := s.store.ResolvePending(context.WithoutCancel(ctx), request.ProposalID, request.CommandID); cleanupErr != nil {
-			// The recorded order is authoritative; a later lookup retries cleanup.
-			return confirmed(*result.Order), nil
-		}
-		return confirmed(*result.Order), nil
-	case contract.RecheckRequired:
-		if result.OrderEvaluation == nil {
-			return contract.ConfirmResult{}, errors.New("missing recheck evaluation")
-		}
-		replacementID := s.newID()
-		if replacementID == "" {
-			resolveErr := s.store.ResolvePending(context.WithoutCancel(ctx), request.ProposalID, request.CommandID)
-			return contract.ConfirmResult{}, errors.Join(contract.ErrInvalidArgument, resolveErr)
-		}
-		evaluation := result.OrderEvaluation
-		replacement := domain.OrderProposal{
-			ProposalID:         replacementID,
-			EvaluatedAt:        evaluation.EvaluatedAt,
-			StateVersion:       evaluation.StateVersion,
-			RequestedPositions: requestedFromAccepted(record.Proposal.AcceptedPositions),
-			AcceptedPositions:  toDomainAcceptedPositions(evaluation.AcceptedPositions),
-			Changes:            toDomainChanges(evaluation.Changes),
-		}
-		saved, err := s.store.Replace(context.WithoutCancel(ctx), request.ProposalID, request.CommandID, replacement)
-		if err != nil {
-			resolveErr := s.store.ResolvePending(context.WithoutCancel(ctx), request.ProposalID, request.CommandID)
-			return contract.ConfirmResult{}, errors.Join(err, resolveErr)
-		}
-		proposal := toContractProposal(saved)
-		return contract.ConfirmResult{Kind: contract.RequiresConfirmation, Proposal: &proposal}, nil
-	default:
-		return contract.ConfirmResult{}, fmt.Errorf("unsupported commit result kind %q", result.Kind)
-	}
-}
-
-func (s *OrdersService) reconcilePending(ctx context.Context, proposalID string) error {
-	cleanupContext := context.WithoutCancel(ctx)
-	record, found, err := s.store.Get(cleanupContext, proposalID)
-	if err != nil {
-		return err
-	}
-	if !found || record.PendingCommandID == "" {
-		return nil
-	}
-	return s.store.ResolvePending(cleanupContext, proposalID, record.PendingCommandID)
-}
-
-func (s *OrdersService) reconcilePendingCommand(ctx context.Context, proposalID, commandID string) error {
-	cleanupContext := context.WithoutCancel(ctx)
-	record, found, err := s.store.Get(cleanupContext, proposalID)
-	if err != nil {
-		return err
-	}
-	if !found || record.PendingCommandID != commandID {
-		return nil
-	}
-	return s.store.ResolvePending(cleanupContext, proposalID, commandID)
+	return s.confirmWithAttempts(ctx, request)
 }
 
 func definiteCommitRejection(err error) bool {
+	var operationError *contract.OperationError
+	if errors.As(err, &operationError) {
+		return operationError.Outcome == "not_committed"
+	}
 	return errors.Is(err, contract.ErrInventoryUnavailable) ||
 		errors.Is(err, contract.ErrInvalidArgument) ||
 		errors.Is(err, contract.ErrCommandIdentityConflict)
@@ -328,14 +204,6 @@ func toContractProposal(proposal domain.OrderProposal) contract.OrderProposal {
 		result.Changes[i] = contract.Change{LineNo: change.LineNo, DishID: change.DishID, RequestedPortions: change.RequestedPortions, AcceptedPortions: change.AcceptedPortions, Deficits: deficits}
 	}
 	return result
-}
-
-func requestedFromAccepted(positions []domain.AcceptedPosition) []domain.Position {
-	requested := make([]domain.Position, len(positions))
-	for i, position := range positions {
-		requested[i] = domain.Position(position)
-	}
-	return requested
 }
 
 func cloneContractOrder(order contract.Order) contract.Order {
