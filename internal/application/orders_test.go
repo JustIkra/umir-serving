@@ -695,6 +695,49 @@ func TestConfirmRecordedIdentityConflictStopsBeforeProposalLookup(t *testing.T) 
 	}
 }
 
+func TestConflictingRecordedCommandDoesNotClearDifferentPendingMarker(t *testing.T) {
+	store := memory.NewProposalStore()
+	createProposal(t, store, proposalFixture("proposal-1", 2))
+	if err := store.MarkPending(context.Background(), "proposal-1", "command-2"); err != nil {
+		t.Fatal(err)
+	}
+	warehouse := newWarehouseFake()
+	otherOrder := contract.Order{OrderID: "other-order", ProposalID: "other-proposal"}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "other-proposal", otherOrder)
+	service := newOrdersService(t, store, warehouse)
+
+	_, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("conflicting command C1 error = %v; want ErrCommandIdentityConflict", err)
+	}
+	record, ok, getErr := store.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "command-2" {
+		t.Fatalf("pending marker after unrelated C1 conflict = (%+v, %v, %v); want original unknown C2", record, ok, getErr)
+	}
+
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-3", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.ConfirmationPending {
+		t.Fatalf("new command C3 while C2 is pending = (%+v, %v); want ConfirmationPending", result, err)
+	}
+	if _, calls := warehouse.commits(); calls != 0 {
+		t.Fatalf("unrelated C1 conflict or blocked C3 made %d warehouse commits; want none", calls)
+	}
+
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	warehouse.recorded["command-2"] = commandRecord("command-2", "proposal-1", order)
+	result, err = service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != order.OrderID {
+		t.Fatalf("retry of original pending C2 = (%+v, %v); want its recorded order", result, err)
+	}
+	record, ok, getErr = store.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "" {
+		t.Fatalf("pending marker after recorded C2 retry = (%+v, %v, %v); want empty", record, ok, getErr)
+	}
+	if _, calls := warehouse.commits(); calls != 0 {
+		t.Fatalf("retry of recorded C2 called warehouse CommitAcceptedOrder %d times; want no new commit", calls)
+	}
+}
+
 func TestAlreadyOrderedProposalReturnsOrderForDifferentCommand(t *testing.T) {
 	warehouse := newWarehouseFake()
 	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}

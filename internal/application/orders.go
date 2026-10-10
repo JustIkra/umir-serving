@@ -92,7 +92,7 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 		order, err := recordedOrder(recorded, request.CommandID, request.ProposalID, fingerprint)
 		if err != nil {
 			if errors.Is(err, contract.ErrCommandIdentityConflict) {
-				if cleanupErr := s.reconcilePending(ctx, request.ProposalID); cleanupErr != nil {
+				if cleanupErr := s.reconcilePendingCommand(ctx, request.ProposalID, request.CommandID); cleanupErr != nil {
 					return contract.ConfirmResult{}, errors.Join(err, fmt.Errorf("reconcile pending confirmation after command identity conflict: %w", cleanupErr))
 				}
 			}
@@ -200,6 +200,18 @@ func (s *OrdersService) reconcilePending(ctx context.Context, proposalID string)
 		return nil
 	}
 	return s.store.ResolvePending(cleanupContext, proposalID, record.PendingCommandID)
+}
+
+func (s *OrdersService) reconcilePendingCommand(ctx context.Context, proposalID, commandID string) error {
+	cleanupContext := context.WithoutCancel(ctx)
+	record, found, err := s.store.Get(cleanupContext, proposalID)
+	if err != nil {
+		return err
+	}
+	if !found || record.PendingCommandID != commandID {
+		return nil
+	}
+	return s.store.ResolvePending(cleanupContext, proposalID, commandID)
 }
 
 func definiteCommitRejection(err error) bool {
