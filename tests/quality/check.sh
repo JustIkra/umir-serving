@@ -80,6 +80,14 @@ printf 'package main\n\nimport "%s/tests/testsupport"\n\nfunc main() { _ = tests
 reject lint 'depguard'
 reject arch 'testsupport'
 printf 'package main\n\nfunc main() {}\n' > "$fixture/cmd/server/main.go"
+factory="$scratch/factory"
+mkdir -p "$factory"
+printf 'module github.com/JustIkra/umir-factory\n\ngo 1.26.5\n' > "$factory/go.mod"
+printf 'package umirfactory\n\nconst Name = "factory"\n' > "$factory/factory.go"
+go mod edit -require=github.com/JustIkra/umir-factory@v0.0.0 -replace="github.com/JustIkra/umir-factory=$factory" "$fixture/go.mod"
+printf 'package main\n\nimport umirfactory "github.com/JustIkra/umir-factory"\n\nfunc main() { _ = umirfactory.Name }\n' > "$fixture/cmd/server/main.go"
+reject lint 'github.com/JustIkra/umir-factory'
+printf 'package main\n\nfunc main() {}\n' > "$fixture/cmd/server/main.go"
 if grep -q '^  domain:' "$root/.go-arch-lint.yml"; then
   mkdir -p "$fixture/internal/domain" "$fixture/internal/application" "$fixture/internal/adapters/memory" "$fixture/bootstrap"
   printf 'package domain\n\ntype ID string\n' > "$fixture/internal/domain/id.go"

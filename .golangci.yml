@@ -38,6 +38,8 @@ linters:
               desc: "Service modules interact through their declared boundary."
             - pkg: "github.com/JustIkra/umir-gateway"
               desc: "Service modules interact through their declared boundary."
+            - pkg: "github.com/JustIkra/umir-factory"
+              desc: "Service code must not import the factory."
         domain:
           list-mode: strict
           files:
