@@ -107,6 +107,32 @@ func healthcheck() (result error) {
 	return nil
 }
 
+type idleConnectionCloser interface{ CloseIdleConnections() }
+
+func serveHTTP(server *http.Server, app idleConnectionCloser, signals context.Context, stop context.CancelFunc, listenAndServe func() error) error {
+	shutdownDone := make(chan error, 1)
+	go func() {
+		<-signals.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		shutdownErr := server.Shutdown(ctx)
+		if shutdownErr != nil {
+			shutdownErr = errors.Join(shutdownErr, server.Close())
+		}
+		app.CloseIdleConnections()
+		shutdownDone <- shutdownErr
+	}()
+	listenErr := listenAndServe()
+	if listenErr == nil {
+		listenErr = errors.New("HTTP listener stopped unexpectedly")
+	}
+	if !errors.Is(listenErr, http.ErrServerClosed) {
+		stop()
+		return errors.Join(listenErr, <-shutdownDone)
+	}
+	return <-shutdownDone
+}
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		if err := healthcheck(); err != nil {
@@ -130,24 +156,8 @@ func main() {
 	}
 	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	shutdownDone := make(chan error, 1)
-	go func() {
-		<-signals.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		shutdownErr := server.Shutdown(ctx)
-		if shutdownErr != nil {
-			shutdownErr = errors.Join(shutdownErr, server.Close())
-		}
-		app.CloseIdleConnections()
-		shutdownDone <- shutdownErr
-	}()
 	log.Printf("umir-serving listening on %s", server.Addr)
-	listenErr := server.ListenAndServe()
-	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
-		log.Fatal(listenErr)
-	}
-	if shutdownErr := <-shutdownDone; shutdownErr != nil {
-		log.Fatal(shutdownErr)
+	if err := serveHTTP(server, app, signals, stop, server.ListenAndServe); err != nil {
+		log.Fatal(err)
 	}
 }
