@@ -14,16 +14,17 @@
 
 Работает HTTP-каркас с `GET /healthz` и команда проверки контейнера `/server healthcheck`.
 `internal/application.OrdersService` подготавливает неизменяемые предложения без резервирования, повторно проверяет их при подтверждении и сериализует попытки по `proposalID`. Он разрешает повтор команды по её типу и отпечатку, сохраняет незавершённый `pendingCommandID`, возвращает уже оформленный заказ и атомарно заменяет уменьшенное предложение. Для замены и подтверждения используются результаты порта warehouse; расчёты FEFO и сроки годности остаются ответственностью склада. `MenuService` передаёт каталожные операции через собственный serving contract, строит меню и стоп-лист из складских оценок. `RecommendationsService` ранжирует доступные блюда по срокам фактически используемых партий и возвращает причины с количеством на порцию.
+In-memory библиотека serving готова: публичные порты принадлежат serving, `bootstrap.NewInMemory` собирает runtime, а проверки её контрактов находятся в собственных тестах модуля. Совместный набор сценариев serving и warehouse ещё ожидает подключения в фабрике. HTTP-команды бизнес-ядра не подключены: production serving transport остаётся незавершённым, а HTTP-каркас предоставляет только health check. Сборка Docker-образа и запуск сервиса для проверки в этой фазе не заявлены.
 Часовой пояс — `Europe/Moscow`; количество ингредиентов хранится целыми тысячными базовой единицы.
 
-## Планируемая структура бизнес-ядра
+## Структура бизнес-ядра
 
 - `internal/domain` содержит модель предложения и глубокое копирование её срезов.
 - `internal/application` задаёт `ProposalStore` и содержит `OrdersService`, `MenuService` и `RecommendationsService`.
 - `internal/adapters/memory` содержит `ProposalStore` с копированием данных, проверкой pending identity и атомарной заменой.
 - Публичный `contract` содержит значения входов/выходов и небольшие порты `OrdersWarehouse`, `CatalogWarehouse` и `MenuWarehouse`. Serving владеет этими портами; production-код не импортирует `umir-warehouse`.
 - Публичный `bootstrap.NewInMemory` собирает memory `ProposalStore` и application services в `Runtime`; `Options` принимает часы, генератор ID и собственные serving-порты склада. Runtime предоставляет методы задач заказов, каталога, меню, стоп-листа и рекомендаций.
-- `cmd/server` остаётся точкой запуска HTTP-каркаса. При подключении новых пакетов Dockerfile нужно обновить: сейчас в build stage копируется только `cmd`.
+- `cmd/server` остаётся точкой запуска HTTP-каркаса. Build stage Dockerfile копирует `cmd`, `contract`, `bootstrap` и `internal`; тестовая поддержка в образ не копируется.
 
 Тестовая сборка межсервисного взаимодействия будет создана в отдельном Go-модуле фабрики `tests/business`. Её bridge будет преобразовывать serving contract DTO в контракты warehouse и вызывать warehouse bootstrap Runtime. Такая сборка проверит оба сервиса вместе без импорта чужих `internal` пакетов и без warehouse-зависимости в production-коде serving.
 
