@@ -36,6 +36,15 @@ type warehouseFake struct {
 	commitHook        func(contract.CommitOrderRequest) (contract.CommitResult, error)
 }
 
+type unavailableProposalStore struct {
+	application.ProposalStore
+	err error
+}
+
+func (s unavailableProposalStore) Get(context.Context, string) (domain.ProposalRecord, bool, error) {
+	return domain.ProposalRecord{}, false, s.err
+}
+
 func newWarehouseFake() *warehouseFake {
 	return &warehouseFake{
 		recorded:         make(map[string]contract.CommandRecord),
@@ -324,6 +333,89 @@ func TestRecordedOrderBeforeProposalLookup(t *testing.T) {
 	}
 	if warehouse.proposalLookupCalls() != 0 {
 		t.Fatalf("recorded order performed proposal lookup %d times", warehouse.proposalLookupCalls())
+	}
+}
+
+func TestRecordedCommandRetryResolvesPending(t *testing.T) {
+	store := memory.NewProposalStore()
+	createProposal(t, store, proposalFixture("proposal-1", 2))
+	if err := store.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
+		t.Fatal(err)
+	}
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
+	service := newOrdersService(t, store, warehouse)
+
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
+		t.Fatalf("ConfirmOrder() = (%+v, %v), want recorded order", result, err)
+	}
+	record, ok, getErr := store.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "" {
+		t.Fatalf("recorded command retry left pending state: (%+v, %v, %v)", record, ok, getErr)
+	}
+	_, calls := warehouse.commits()
+	if calls != 0 {
+		t.Fatalf("recorded command retry called CommitAcceptedOrder %d times", calls)
+	}
+}
+
+func TestProposalLookupWithDifferentCommandResolvesOriginalPending(t *testing.T) {
+	store := memory.NewProposalStore()
+	createProposal(t, store, proposalFixture("proposal-1", 2))
+	if err := store.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
+		t.Fatal(err)
+	}
+	warehouse := newWarehouseFake()
+	warehouse.ordersByProposal["proposal-1"] = contract.Order{
+		OrderID:    "order-1",
+		ProposalID: "proposal-1",
+		Positions:  []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}},
+	}
+	service := newOrdersService(t, store, warehouse)
+
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
+		t.Fatalf("ConfirmOrder() = (%+v, %v), want proposal's recorded order", result, err)
+	}
+	record, ok, getErr := store.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "" {
+		t.Fatalf("C2 proposal recovery left original pending state: (%+v, %v, %v)", record, ok, getErr)
+	}
+	_, calls := warehouse.commits()
+	if calls != 0 {
+		t.Fatalf("proposal recovery called CommitAcceptedOrder %d times", calls)
+	}
+}
+
+func TestRecordedOrderReturnsWhenProposalStoreIsMissing(t *testing.T) {
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
+	service := newOrdersService(t, memory.NewProposalStore(), warehouse)
+
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
+		t.Fatalf("ConfirmOrder() = (%+v, %v), want recorded order without stored proposal", result, err)
+	}
+}
+
+func TestRecordedOrderReturnsWhenProposalStoreIsUnavailable(t *testing.T) {
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
+	storeErr := errors.New("temporary proposal store outage")
+	store := unavailableProposalStore{ProposalStore: memory.NewProposalStore(), err: storeErr}
+	service := newOrdersService(t, store, warehouse)
+
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
+		t.Fatalf("ConfirmOrder() = (%+v, %v), want recorded order despite store error %v", result, err, storeErr)
+	}
+	_, calls := warehouse.commits()
+	if calls != 0 {
+		t.Fatalf("recorded order recovery committed %d times", calls)
 	}
 }
 

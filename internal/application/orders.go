@@ -93,6 +93,7 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 		if err != nil {
 			return contract.ConfirmResult{}, err
 		}
+		s.resolvePendingAfterRecordedOrder(ctx, request.ProposalID)
 		return confirmed(order), nil
 	}
 	order, found, err := s.warehouse.FindOrderByProposal(ctx, request.ProposalID)
@@ -100,6 +101,7 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 		return contract.ConfirmResult{}, err
 	}
 	if found {
+		s.resolvePendingAfterRecordedOrder(ctx, request.ProposalID)
 		return confirmed(order), nil
 	}
 
@@ -174,6 +176,15 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 	default:
 		return contract.ConfirmResult{}, fmt.Errorf("unsupported commit result kind %q", result.Kind)
 	}
+}
+
+func (s *OrdersService) resolvePendingAfterRecordedOrder(ctx context.Context, proposalID string) {
+	cleanupContext := context.WithoutCancel(ctx)
+	record, found, err := s.store.Get(cleanupContext, proposalID)
+	if err != nil || !found || record.PendingCommandID == "" {
+		return
+	}
+	_ = s.store.ResolvePending(cleanupContext, proposalID, record.PendingCommandID)
 }
 
 func (s *OrdersService) lockProposal(proposalID string) func() {
