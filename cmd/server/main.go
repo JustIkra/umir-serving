@@ -32,14 +32,14 @@ func handler() (http.Handler, error) {
 	return mux, nil
 }
 
-func healthcheck() (err error) {
+func healthcheck() (result error) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	response, err := client.Get("http://127.0.0.1:" + env("PORT", "8080") + "/healthz")
 	if err != nil {
 		return err
 	}
 	defer func() {
-		err = errors.Join(err, response.Body.Close())
+		result = errors.Join(result, response.Body.Close())
 	}()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("health status: %d", response.StatusCode)
@@ -75,7 +75,7 @@ func main() {
 		}
 	}()
 	log.Printf("umir-serving listening on %s", server.Addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }

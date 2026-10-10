@@ -30,30 +30,23 @@ linters:
       rules:
         production-boundaries:
           list-mode: lax
-          files: ["!$test"]
+          files: ["$all", "!$test"]
           deny:
             - pkg: "github.com/JustIkra/umir-serving/tests/"
               desc: "Production must not import test support."
-        cross-service-imports:
-          list-mode: lax
-          files: ["!$test"]
-          deny:
             - pkg: "github.com/JustIkra/umir-warehouse"
-              desc: "Services communicate through explicit public contracts."
-            - pkg: "github.com/JustIkra/umir-factory"
-              desc: "Service code must not import the factory."
+              desc: "Service modules interact through their declared boundary."
+            - pkg: "github.com/JustIkra/umir-gateway"
+              desc: "Service modules interact through their declared boundary."
         domain:
           list-mode: strict
           files:
-            - "**/internal/domain/*.go"
-            - "**/internal/domain/**/*.go"
+            - "**/internal/domain/**"
             - "!$test"
           allow:
             - "bytes$"
             - "cmp$"
             - "errors$"
-            - "crypto/sha256$"
-            - "encoding/hex$"
             - "fmt$"
             - "maps$"
             - "math$"
@@ -66,17 +59,17 @@ linters:
             - "time$"
             - "unicode$"
             - "unicode/utf8$"
+            - "github.com/JustIkra/umir-serving/internal/domain/"
+            - "github.com/JustIkra/umir-serving/internal/domain$"
         contract:
           list-mode: strict
           files:
-            - "**/contract/*.go"
-            - "**/contract/**/*.go"
+            - "**/contract/**"
             - "!$test"
           allow:
             - "bytes$"
             - "cmp$"
             - "errors$"
-            - "context$"
             - "fmt$"
             - "maps$"
             - "math$"
@@ -89,11 +82,12 @@ linters:
             - "time$"
             - "unicode$"
             - "unicode/utf8$"
+            - "github.com/JustIkra/umir-serving/contract/"
+            - "github.com/JustIkra/umir-serving/contract$"
         application:
           list-mode: strict
           files:
-            - "**/internal/application/*.go"
-            - "**/internal/application/**/*.go"
+            - "**/internal/application/**"
             - "!$test"
           allow:
             - "bytes$"
@@ -114,9 +108,6 @@ linters:
             - "context$"
             - "sync$"
             - "sync/atomic$"
-            - "crypto/sha256$"
-            - "encoding/hex$"
-            - "encoding/json$"
             - "github.com/JustIkra/umir-serving/internal/domain/"
             - "github.com/JustIkra/umir-serving/internal/domain$"
             - "github.com/JustIkra/umir-serving/contract/"
@@ -126,11 +117,10 @@ linters:
     forbidigo:
       analyze-types: true
       forbid:
-        - pattern: '^time\.(Now|Sleep|After|AfterFunc|Tick|NewTimer|NewTicker)$'
+        - pattern: '^time\.(Now|Since|Until|Sleep|After|AfterFunc|Tick|NewTimer|NewTicker)$'
           msg: "Inject time and scheduling dependencies into the pure core."
   exclusions:
     presets: []
-    warn-unused: true
     rules:
       - linters: [forbidigo]
         path-except: '^(internal/(domain|application)/|contract/)'

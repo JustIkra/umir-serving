@@ -15,6 +15,10 @@ inventory() {
     printf 'Missing or undeclared Go module; update the reviewed inventory\n' >&2
     exit 1
   fi
+  if [[ "$(cat "$scratch/expected-modules")" != "." ]]; then
+    printf 'Nested modules require separate quality gates; this runner checks only the root module\n' >&2
+    exit 1
+  fi
 }
 tool() {
   local name="$1" version="$2" candidate output
@@ -31,21 +35,31 @@ tool() {
   printf '%s\n' "$candidate"
 }
 format_check() {
-  local lint
+  local lint status=0
   lint="$(tool golangci-lint "$GOLANGCI_LINT_VERSION")"
-  "$lint" fmt --config "$root/.golangci.yml" --diff > "$scratch/format.diff"
+  "$lint" fmt --config "$root/.golangci.yml" --diff > "$scratch/format.diff" || status=$?
   if [[ -s "$scratch/format.diff" ]]; then
     cat "$scratch/format.diff"
     printf 'Formatting differences found; format explicit changed files\n' >&2
     return 1
   fi
+  return "$status"
 }
-build() { go build ./...; }
+build() {
+  local package_names
+  package_names="$(go list -f '{{.Name}}' ./...)"
+  if grep -qx main <<< "$package_names"; then
+    mkdir -p "$scratch/build"
+    go build -o "$scratch/build/" ./...
+  else
+    go build ./...
+  fi
+}
 lint() {
   local lint
   lint="$(tool golangci-lint "$GOLANGCI_LINT_VERSION")"
   "$lint" config verify --config "$root/.golangci.yml"
-  "$lint" run --config "$root/.golangci.yml" ./...
+  "$lint" run --allow-serial-runners --config "$root/.golangci.yml" ./...
 }
 architecture() {
   local arch
@@ -53,26 +67,13 @@ architecture() {
   "$arch" --output-color=false check --project-path "$root" --arch-file "$root/.go-arch-lint.yml"
 }
 tests() { go test -race -count=1 ./...; }
-format_paths() {
-  local path lint
-  local -a paths=()
-  if [[ $# -gt 0 ]]; then
-    if [[ "$1" == "--" ]]; then shift; fi
-    [[ $# -gt 0 ]] || { printf 'Provide one or more paths after --\n' >&2; return 1; }
-    paths=("$@")
-  else
-    [[ -n "${FILES:-}" ]] || { printf 'Set FILES to newline-separated paths, or pass paths after --\n' >&2; return 1; }
-    while IFS= read -r path || [[ -n "$path" ]]; do
-      [[ -n "$path" ]] && paths+=("$path")
-    done <<< "$FILES"
-    [[ ${#paths[@]} -gt 0 ]] || { printf 'FILES must contain at least one non-empty path\n' >&2; return 1; }
-  fi
-  lint="$(tool golangci-lint "$GOLANGCI_LINT_VERSION")"
-  "$lint" fmt --config "$root/.golangci.yml" "${paths[@]}"
-}
 inventory
 case "$action" in
-  fmt) format_paths "$@" ;;
+  fmt)
+    [[ $# -gt 0 ]] || { printf 'Provide explicit paths: make fmt FILES="path.go"\n' >&2; exit 1; }
+    lint="$(tool golangci-lint "$GOLANGCI_LINT_VERSION")"
+    "$lint" fmt --config "$root/.golangci.yml" "$@"
+    ;;
   fmt-all)
     lint="$(tool golangci-lint "$GOLANGCI_LINT_VERSION")"
     "$lint" fmt --config "$root/.golangci.yml"
