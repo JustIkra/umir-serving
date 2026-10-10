@@ -213,9 +213,19 @@ type Recommendations struct {
 }
 
 type Recommendation struct {
-	DishID      string
-	DishName    string
-	Allocations []Allocation
+	DishID            string
+	DishName          string
+	PriorityExpiresAt time.Time
+	Reasons           []RecommendationReason
+}
+
+type RecommendationReason struct {
+	ProductID          string
+	ProductName        string
+	BatchID            string
+	QuantityPerPortion int64
+	BaseUnit           string
+	ExpiresAt          time.Time
 }
 
 type InventoryView struct {
