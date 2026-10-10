@@ -182,7 +182,7 @@ func acceptedPositionsWithin(next, previous []domain.AcceptedPosition) bool {
 func requestedFromAccepted(positions []domain.AcceptedPosition) []domain.Position {
 	requested := make([]domain.Position, len(positions))
 	for i, position := range positions {
-		requested[i] = domain.Position{LineNo: position.LineNo, DishID: position.DishID, Portions: position.Portions}
+		requested[i] = domain.Position(position)
 	}
 	return requested
 }

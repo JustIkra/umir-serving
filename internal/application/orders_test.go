@@ -41,8 +41,17 @@ type unavailableProposalStore struct {
 	err error
 }
 
+type failingResolveProposalStore struct {
+	application.ProposalStore
+	err error
+}
+
 func (s unavailableProposalStore) Get(context.Context, string) (domain.ProposalRecord, bool, error) {
 	return domain.ProposalRecord{}, false, s.err
+}
+
+func (s failingResolveProposalStore) ResolvePending(context.Context, string, string) error {
+	return s.err
 }
 
 func newWarehouseFake() *warehouseFake {
@@ -94,12 +103,6 @@ func (w *warehouseFake) FindOrderByProposal(_ context.Context, proposalID string
 	}
 	order, ok := w.ordersByProposal[proposalID]
 	return cloneOrder(order), ok, nil
-}
-
-func (w *warehouseFake) recordedCommandCalls() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.findCommandCalls
 }
 
 func (w *warehouseFake) proposalLookupCalls() int {
@@ -419,6 +422,29 @@ func TestRecordedOrderReturnsWhenProposalStoreIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestRecordedOrderRemainsAuthoritativeWhenPendingResolutionFails(t *testing.T) {
+	baseStore := memory.NewProposalStore()
+	createProposal(t, baseStore, proposalFixture("proposal-1", 2))
+	if err := baseStore.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
+		t.Fatal(err)
+	}
+	storeErr := errors.New("temporary pending resolution failure")
+	store := failingResolveProposalStore{ProposalStore: baseStore, err: storeErr}
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
+	service := newOrdersService(t, store, warehouse)
+
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
+		t.Fatalf("ConfirmOrder() = (%+v, %v), want recorded order despite cleanup error %v", result, err, storeErr)
+	}
+	record, ok, getErr := baseStore.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "command-1" {
+		t.Fatalf("pending state after failed best-effort cleanup = (%+v, %v, %v), want unchanged pending command", record, ok, getErr)
+	}
+}
+
 func TestCancelledAfterWarehouseCommit(t *testing.T) {
 	store := memory.NewProposalStore()
 	warehouse := newWarehouseFake()
@@ -642,17 +668,21 @@ func TestConfirmConcurrentAttemptsSerializeWholeWarehouseCall(t *testing.T) {
 		firstDone <- err
 	}()
 	<-entered
-	secondDone := make(chan contract.ConfirmResult, 1)
+	type confirmResponse struct {
+		result contract.ConfirmResult
+		err    error
+	}
+	secondDone := make(chan confirmResponse, 1)
 	go func() {
-		result, _ := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
-		secondDone <- result
+		result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
+		secondDone <- confirmResponse{result: result, err: err}
 	}()
 	close(release)
 	if err := <-firstDone; err == nil {
 		t.Fatal("first ConfirmOrder() unexpectedly succeeded")
 	}
-	if result := <-secondDone; result.Kind != contract.OrderConfirmed {
-		t.Fatalf("concurrent second result = %+v, want recorded order", result)
+	if response := <-secondDone; response.err != nil || response.result.Kind != contract.OrderConfirmed {
+		t.Fatalf("concurrent second result = (%+v, %v), want recorded order", response.result, response.err)
 	}
 	_, calls := warehouse.commits()
 	if calls != 1 {
@@ -741,9 +771,12 @@ func commandRecord(commandID, proposalID string, order contract.Order) contract.
 }
 
 func confirmFingerprint(proposalID string) string {
-	input, _ := json.Marshal(struct {
+	input, err := json.Marshal(struct {
 		ProposalID string `json:"proposalID"`
 	}{ProposalID: proposalID})
+	if err != nil {
+		panic(err)
+	}
 	digest := sha256.Sum256(append([]byte("ConfirmOrder\x00"), input...))
 	return hex.EncodeToString(digest[:])
 }

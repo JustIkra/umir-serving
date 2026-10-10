@@ -184,7 +184,9 @@ func (s *OrdersService) resolvePendingAfterRecordedOrder(ctx context.Context, pr
 	if err != nil || !found || record.PendingCommandID == "" {
 		return
 	}
-	_ = s.store.ResolvePending(cleanupContext, proposalID, record.PendingCommandID)
+	if err := s.store.ResolvePending(cleanupContext, proposalID, record.PendingCommandID); err != nil {
+		return
+	}
 }
 
 func (s *OrdersService) lockProposal(proposalID string) func() {
@@ -300,7 +302,7 @@ func toContractProposal(proposal domain.OrderProposal) contract.OrderProposal {
 func requestedFromAccepted(positions []domain.AcceptedPosition) []domain.Position {
 	requested := make([]domain.Position, len(positions))
 	for i, position := range positions {
-		requested[i] = domain.Position{LineNo: position.LineNo, DishID: position.DishID, Portions: position.Portions}
+		requested[i] = domain.Position(position)
 	}
 	return requested
 }
