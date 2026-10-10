@@ -13,11 +13,11 @@ import (
 func TestRecommendationsActualAllocations(t *testing.T) {
 	priority := time.Date(2026, 10, 11, 9, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
 	warehouse := &menuPortFake{evaluation: contract.MenuEvaluation{Dishes: []contract.DishEvaluation{
-		{DishID: "dish", DishName: "Dish", IsAvailable: true, Allocations: []contract.Allocation{
+		{DishID: "dish", DishName: "Dish", IsAvailable: true, Allocations: []contract.MenuAllocation{
 			{ProductID: "rice", ProductName: "Rice", BatchID: "batch-early", Quantity: 250, BaseUnit: "g", ExpiresAt: priority},
 			{ProductID: "rice", ProductName: "Rice", BatchID: "batch-late", Quantity: 750, BaseUnit: "g", ExpiresAt: priority.Add(24 * time.Hour)},
 		}},
-		{DishID: "unavailable", IsAvailable: false, Allocations: []contract.Allocation{{ProductID: "oil", BatchID: "ignored", Quantity: 900, ExpiresAt: priority.Add(-time.Hour)}}},
+		{DishID: "unavailable", IsAvailable: false, Allocations: []contract.MenuAllocation{{ProductID: "oil", BatchID: "ignored", Quantity: 900, ExpiresAt: priority.Add(-time.Hour)}}},
 	}}}
 	service := application.NewRecommendationsService(warehouse)
 
@@ -39,7 +39,7 @@ func TestRecommendationsActualAllocations(t *testing.T) {
 func TestRecommendationTiedReasons(t *testing.T) {
 	priority := time.Date(2026, 10, 11, 9, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
 	warehouse := &menuPortFake{evaluation: contract.MenuEvaluation{Dishes: []contract.DishEvaluation{{
-		DishID: "dish", DishName: "Dish", IsAvailable: true, Allocations: []contract.Allocation{
+		DishID: "dish", DishName: "Dish", IsAvailable: true, Allocations: []contract.MenuAllocation{
 			{ProductID: "z-product", ProductName: "Z", BatchID: "z-batch", Quantity: 7, BaseUnit: "ml", ExpiresAt: priority},
 			{ProductID: "a-product", ProductName: "A", BatchID: "b-batch", Quantity: 11, BaseUnit: "g", ExpiresAt: priority},
 			{ProductID: "a-product", ProductName: "A", BatchID: "a-batch", Quantity: 13, BaseUnit: "g", ExpiresAt: priority},
@@ -65,8 +65,8 @@ func TestRecommendationTiedReasons(t *testing.T) {
 func TestRecommendationDishTie(t *testing.T) {
 	priority := time.Date(2026, 10, 11, 9, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
 	warehouse := &menuPortFake{evaluation: contract.MenuEvaluation{Dishes: []contract.DishEvaluation{
-		{DishID: "dish-z", DishName: "Z", IsAvailable: true, Allocations: []contract.Allocation{{ProductID: "rice", BatchID: "batch-z", Quantity: 100, ExpiresAt: priority}}},
-		{DishID: "dish-a", DishName: "A", IsAvailable: true, Allocations: []contract.Allocation{{ProductID: "rice", BatchID: "batch-a", Quantity: 100, ExpiresAt: priority}}},
+		{DishID: "dish-z", DishName: "Z", IsAvailable: true, Allocations: []contract.MenuAllocation{{ProductID: "rice", BatchID: "batch-z", Quantity: 100, ExpiresAt: priority}}},
+		{DishID: "dish-a", DishName: "A", IsAvailable: true, Allocations: []contract.MenuAllocation{{ProductID: "rice", BatchID: "batch-a", Quantity: 100, ExpiresAt: priority}}},
 	}}}
 	service := application.NewRecommendationsService(warehouse)
 

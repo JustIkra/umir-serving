@@ -128,7 +128,7 @@ func TestRuntimeServicesPreserveProposalDataAndReturnCatalogCopies(t *testing.T)
 			Changes:            []contract.Change{{LineNo: 1, DishID: "soup", RequestedPortions: 3, AcceptedPortions: 2, Deficits: []contract.Deficit{{ProductID: "tomato", RequiredQuantity: 3000, AvailableQuantity: 2000}}}},
 		},
 		commit:  contract.CommitResult{Kind: contract.OrderCommitted, Order: &contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 1, DishID: "soup", Portions: 2}}, PlacedAt: at}},
-		catalog: contract.DishCatalog{{DishID: "soup", Name: "Soup", Recipe: []contract.Ingredient{{ProductID: "tomato", Quantity: 1000, BaseUnit: "g"}}}},
+		catalog: contract.DishCatalog{EvaluatedAt: at, StateVersion: 7, Items: []contract.Dish{{DishID: "soup", Name: "Soup", Recipe: []contract.Ingredient{{ProductID: "tomato", Quantity: 1000, BaseUnit: "g"}}}}},
 	}
 	options := validOptions(warehouse)
 	options.Now = func() time.Time { return at }
@@ -163,13 +163,13 @@ func TestRuntimeServicesPreserveProposalDataAndReturnCatalogCopies(t *testing.T)
 	if err != nil {
 		t.Fatalf("GetDishCatalog() error = %v", err)
 	}
-	catalog[0].Recipe[0].Quantity = 9000
+	catalog.Items[0].Recipe[0].Quantity = 9000
 	again, err := runtime.GetDishCatalog(context.Background())
 	if err != nil {
 		t.Fatalf("second GetDishCatalog() error = %v", err)
 	}
-	if again[0].Recipe[0].Quantity != 1000 {
-		t.Fatalf("catalog mutation leaked into later result: quantity=%d", again[0].Recipe[0].Quantity)
+	if again.Items[0].Recipe[0].Quantity != 1000 {
+		t.Fatalf("catalog mutation leaked into later result: quantity=%d", again.Items[0].Recipe[0].Quantity)
 	}
 	if idCalls != 1 {
 		t.Fatalf("ID generator calls = %d, want 1 after one proposal", idCalls)

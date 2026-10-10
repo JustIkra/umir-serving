@@ -62,7 +62,7 @@ func TestMenuStopListComplement(t *testing.T) {
 		EvaluatedAt:  evaluatedAt,
 		StateVersion: 19,
 		Dishes: []contract.DishEvaluation{
-			{DishID: "dish-available", DishName: "Available", IsAvailable: true, Allocations: []contract.Allocation{{ProductID: "rice", Quantity: 100}}},
+			{DishID: "dish-available", DishName: "Available", IsAvailable: true, Allocations: []contract.MenuAllocation{{ProductID: "rice", Quantity: 100}}},
 			{DishID: "dish-stopped", DishName: "Stopped", IsAvailable: false, Deficits: []contract.Deficit{{ProductID: "oil", RequiredQuantity: 50, AvailableQuantity: 0}}},
 		},
 	}}
@@ -108,11 +108,11 @@ func TestMenuPreparationUnavailable(t *testing.T) {
 
 func TestMenuCatalogForwardingPreservesValuesAndCopiesSlices(t *testing.T) {
 	warehouse := &catalogPortFake{
-		products: contract.Products{{ProductID: "z-product", Name: "Z", BaseUnit: "g"}, {ProductID: "a-product", Name: "A", BaseUnit: "g"}},
-		catalog: contract.DishCatalog{
+		products: contract.Products{EvaluatedAt: time.Date(2026, 10, 10, 14, 0, 0, 0, time.FixedZone("MSK", 3*60*60)), StateVersion: 23, Items: []contract.Product{{ProductID: "z-product", Name: "Z", BaseUnit: "g"}, {ProductID: "a-product", Name: "A", BaseUnit: "g"}}},
+		catalog: contract.DishCatalog{EvaluatedAt: time.Date(2026, 10, 10, 15, 0, 0, 0, time.FixedZone("MSK", 3*60*60)), StateVersion: 29, Items: []contract.Dish{
 			{DishID: "z-dish", Name: "Z", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 100, BaseUnit: "g"}}},
 			{DishID: "a-dish", Name: "A", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 200, BaseUnit: "g"}}},
-		},
+		}},
 		dish:    contract.Dish{DishID: "dish", Name: "Dish", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 100, BaseUnit: "g"}}},
 		product: contract.Product{ProductID: "sugar", Name: "Sugar", BaseUnit: "g"},
 		defined: contract.Dish{DishID: "sweet", Name: "Sweet", Recipe: []contract.Ingredient{{ProductID: "sugar", Quantity: 20, BaseUnit: "g"}}},
@@ -120,23 +120,23 @@ func TestMenuCatalogForwardingPreservesValuesAndCopiesSlices(t *testing.T) {
 	service := application.NewMenuService(warehouse, &menuPortFake{})
 
 	products, err := service.GetProducts(context.Background())
-	if err != nil || !reflect.DeepEqual(products, contract.Products{{ProductID: "a-product", Name: "A", BaseUnit: "g"}, {ProductID: "z-product", Name: "Z", BaseUnit: "g"}}) {
+	if err != nil || products.EvaluatedAt != warehouse.products.EvaluatedAt || products.StateVersion != warehouse.products.StateVersion || !reflect.DeepEqual(products.Items, []contract.Product{{ProductID: "a-product", Name: "A", BaseUnit: "g"}, {ProductID: "z-product", Name: "Z", BaseUnit: "g"}}) {
 		t.Fatalf("GetProducts() = %+v, %v", products, err)
 	}
-	products[0].Name = "mutated"
-	if warehouse.products[1].Name != "A" {
+	products.Items[0].Name = "mutated"
+	if warehouse.products.Items[1].Name != "A" {
 		t.Fatal("GetProducts() exposed warehouse product slice")
 	}
 
 	catalog, err := service.GetDishCatalog(context.Background())
-	if err != nil || !reflect.DeepEqual(catalog, contract.DishCatalog{
+	if err != nil || catalog.EvaluatedAt != warehouse.catalog.EvaluatedAt || catalog.StateVersion != warehouse.catalog.StateVersion || !reflect.DeepEqual(catalog.Items, []contract.Dish{
 		{DishID: "a-dish", Name: "A", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 200, BaseUnit: "g"}}},
 		{DishID: "z-dish", Name: "Z", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 100, BaseUnit: "g"}}},
 	}) {
 		t.Fatalf("GetDishCatalog() = %+v, %v", catalog, err)
 	}
-	catalog[0].Recipe[0].Quantity = 1
-	if warehouse.catalog[1].Recipe[0].Quantity != 200 {
+	catalog.Items[0].Recipe[0].Quantity = 1
+	if warehouse.catalog.Items[1].Recipe[0].Quantity != 200 {
 		t.Fatal("GetDishCatalog() exposed warehouse recipe slice")
 	}
 

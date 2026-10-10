@@ -33,11 +33,11 @@ func (ordersWarehouse) FindOrderByProposal(context.Context, string) (contract.Or
 }
 
 func (catalogWarehouse) GetProducts(context.Context) (contract.Products, error) {
-	return nil, nil
+	return contract.Products{}, nil
 }
 
 func (catalogWarehouse) GetDishCatalog(context.Context) (contract.DishCatalog, error) {
-	return nil, nil
+	return contract.DishCatalog{}, nil
 }
 
 func (catalogWarehouse) GetDish(context.Context, string) (contract.Dish, error) {

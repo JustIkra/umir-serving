@@ -95,6 +95,12 @@ type Batch struct {
 }
 
 type Allocation struct {
+	ProductID string
+	BatchID   string
+	Quantity  int64
+}
+
+type MenuAllocation struct {
 	ProductID   string
 	ProductName string
 	BatchID     string
@@ -130,7 +136,7 @@ type DishEvaluation struct {
 	DishName    string
 	IsAvailable bool
 	Deficits    []Deficit
-	Allocations []Allocation
+	Allocations []MenuAllocation
 }
 
 type OrderProposal struct {
@@ -180,7 +186,11 @@ const (
 
 type ExpiryResult struct {
 	BatchID            string
+	ProductID          string
 	WrittenOffQuantity int64
+	Reason             string
+	ExpiresAt          time.Time
+	ProcessedAt        time.Time
 }
 
 type Menu struct {
@@ -316,6 +326,14 @@ type ExpireBatchRequest struct {
 	BatchID   string
 }
 
-type Products []Product
+type Products struct {
+	EvaluatedAt  time.Time
+	StateVersion int64
+	Items        []Product
+}
 
-type DishCatalog []Dish
+type DishCatalog struct {
+	EvaluatedAt  time.Time
+	StateVersion int64
+	Items        []Dish
+}

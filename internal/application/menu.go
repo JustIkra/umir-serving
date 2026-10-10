@@ -17,25 +17,33 @@ func NewMenuService(catalog contract.CatalogWarehouse, menu contract.MenuWarehou
 }
 
 func (s *MenuService) GetProducts(ctx context.Context) (contract.Products, error) {
-	products, err := s.catalog.GetProducts(ctx)
+	catalog, err := s.catalog.GetProducts(ctx)
 	if err != nil {
-		return nil, err
+		return contract.Products{}, err
 	}
-	result := append(make(contract.Products, 0, len(products)), products...)
-	sort.Slice(result, func(i, j int) bool { return result[i].ProductID < result[j].ProductID })
+	result := contract.Products{
+		EvaluatedAt:  catalog.EvaluatedAt,
+		StateVersion: catalog.StateVersion,
+		Items:        append(make([]contract.Product, 0, len(catalog.Items)), catalog.Items...),
+	}
+	sort.Slice(result.Items, func(i, j int) bool { return result.Items[i].ProductID < result.Items[j].ProductID })
 	return result, nil
 }
 
 func (s *MenuService) GetDishCatalog(ctx context.Context) (contract.DishCatalog, error) {
-	dishes, err := s.catalog.GetDishCatalog(ctx)
+	catalog, err := s.catalog.GetDishCatalog(ctx)
 	if err != nil {
-		return nil, err
+		return contract.DishCatalog{}, err
 	}
-	result := make(contract.DishCatalog, len(dishes))
-	for i, dish := range dishes {
-		result[i] = cloneContractDish(dish)
+	result := contract.DishCatalog{
+		EvaluatedAt:  catalog.EvaluatedAt,
+		StateVersion: catalog.StateVersion,
+		Items:        make([]contract.Dish, len(catalog.Items)),
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].DishID < result[j].DishID })
+	for i, dish := range catalog.Items {
+		result.Items[i] = cloneContractDish(dish)
+	}
+	sort.Slice(result.Items, func(i, j int) bool { return result.Items[i].DishID < result.Items[j].DishID })
 	return result, nil
 }
 
