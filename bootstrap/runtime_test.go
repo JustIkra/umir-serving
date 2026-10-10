@@ -47,8 +47,8 @@ func (w *warehouseStub) GetDishCatalog(context.Context) (contract.DishCatalog, e
 	return w.catalog, nil
 }
 
-func (*warehouseStub) GetDish(context.Context, string) (contract.Dish, error) {
-	return contract.Dish{}, nil
+func (*warehouseStub) GetDish(context.Context, string) (contract.DishDetails, error) {
+	return contract.DishDetails{}, nil
 }
 
 func (*warehouseStub) RegisterProduct(context.Context, contract.RegisterProductRequest) (contract.Product, error) {

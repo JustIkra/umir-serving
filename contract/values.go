@@ -46,6 +46,12 @@ type Dish struct {
 	Recipe []Ingredient
 }
 
+type DishDetails struct {
+	EvaluatedAt  time.Time
+	StateVersion int64
+	Dish         Dish
+}
+
 type ShelfLife struct {
 	Unit  string
 	Value int64

@@ -40,8 +40,8 @@ func (catalogWarehouse) GetDishCatalog(context.Context) (contract.DishCatalog, e
 	return contract.DishCatalog{}, nil
 }
 
-func (catalogWarehouse) GetDish(context.Context, string) (contract.Dish, error) {
-	return contract.Dish{}, nil
+func (catalogWarehouse) GetDish(context.Context, string) (contract.DishDetails, error) {
+	return contract.DishDetails{}, nil
 }
 
 func (catalogWarehouse) RegisterProduct(context.Context, contract.RegisterProductRequest) (contract.Product, error) {

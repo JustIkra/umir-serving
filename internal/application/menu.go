@@ -47,12 +47,13 @@ func (s *MenuService) GetDishCatalog(ctx context.Context) (contract.DishCatalog,
 	return result, nil
 }
 
-func (s *MenuService) GetDish(ctx context.Context, dishID string) (contract.Dish, error) {
-	dish, err := s.catalog.GetDish(ctx, dishID)
+func (s *MenuService) GetDish(ctx context.Context, dishID string) (contract.DishDetails, error) {
+	details, err := s.catalog.GetDish(ctx, dishID)
 	if err != nil {
-		return contract.Dish{}, err
+		return contract.DishDetails{}, err
 	}
-	return cloneContractDish(dish), nil
+	details.Dish = cloneContractDish(details.Dish)
+	return details, nil
 }
 
 func (s *MenuService) RegisterProduct(ctx context.Context, request contract.RegisterProductRequest) (contract.Product, error) {

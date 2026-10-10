@@ -25,7 +25,7 @@ func (w *menuPortFake) EvaluateMenu(context.Context) (contract.MenuEvaluation, e
 type catalogPortFake struct {
 	products      contract.Products
 	catalog       contract.DishCatalog
-	dish          contract.Dish
+	dish          contract.DishDetails
 	product       contract.Product
 	defined       contract.Dish
 	gotDishID     string
@@ -41,7 +41,7 @@ func (w *catalogPortFake) GetDishCatalog(context.Context) (contract.DishCatalog,
 	return w.catalog, nil
 }
 
-func (w *catalogPortFake) GetDish(_ context.Context, dishID string) (contract.Dish, error) {
+func (w *catalogPortFake) GetDish(_ context.Context, dishID string) (contract.DishDetails, error) {
 	w.gotDishID = dishID
 	return w.dish, nil
 }
@@ -113,7 +113,11 @@ func TestMenuCatalogForwardingPreservesValuesAndCopiesSlices(t *testing.T) {
 			{DishID: "z-dish", Name: "Z", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 100, BaseUnit: "g"}}},
 			{DishID: "a-dish", Name: "A", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 200, BaseUnit: "g"}}},
 		}},
-		dish:    contract.Dish{DishID: "dish", Name: "Dish", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 100, BaseUnit: "g"}}},
+		dish: contract.DishDetails{
+			EvaluatedAt:  time.Date(2026, 10, 10, 16, 0, 0, 0, time.FixedZone("MSK", 3*60*60)),
+			StateVersion: 31,
+			Dish:         contract.Dish{DishID: "dish", Name: "Dish", Recipe: []contract.Ingredient{{ProductID: "rice", Quantity: 100, BaseUnit: "g"}}},
+		},
 		product: contract.Product{ProductID: "sugar", Name: "Sugar", BaseUnit: "g"},
 		defined: contract.Dish{DishID: "sweet", Name: "Sweet", Recipe: []contract.Ingredient{{ProductID: "sugar", Quantity: 20, BaseUnit: "g"}}},
 	}
@@ -141,11 +145,11 @@ func TestMenuCatalogForwardingPreservesValuesAndCopiesSlices(t *testing.T) {
 	}
 
 	dish, err := service.GetDish(context.Background(), "dish-7")
-	if err != nil || dish.DishID != "dish" || warehouse.gotDishID != "dish-7" {
+	if err != nil || !reflect.DeepEqual(dish.Dish, warehouse.dish.Dish) || dish.EvaluatedAt != warehouse.dish.EvaluatedAt || dish.StateVersion != warehouse.dish.StateVersion || warehouse.gotDishID != "dish-7" {
 		t.Fatalf("GetDish() = %+v, %v; forwarded ID = %q", dish, err, warehouse.gotDishID)
 	}
-	dish.Recipe[0].Quantity = 2
-	if warehouse.dish.Recipe[0].Quantity != 100 {
+	dish.Dish.Recipe[0].Quantity = 2
+	if warehouse.dish.Dish.Recipe[0].Quantity != 100 {
 		t.Fatal("GetDish() exposed warehouse recipe slice")
 	}
 

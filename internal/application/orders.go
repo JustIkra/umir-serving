@@ -91,9 +91,17 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 	if found {
 		order, err := recordedOrder(recorded, request.CommandID, request.ProposalID, fingerprint)
 		if err != nil {
+			if errors.Is(err, contract.ErrCommandIdentityConflict) {
+				if cleanupErr := s.reconcilePending(ctx, request.ProposalID); cleanupErr != nil {
+					return contract.ConfirmResult{}, errors.Join(err, fmt.Errorf("reconcile pending confirmation after command identity conflict: %w", cleanupErr))
+				}
+			}
 			return contract.ConfirmResult{}, err
 		}
-		s.resolvePendingAfterRecordedOrder(ctx, request.ProposalID)
+		if cleanupErr := s.reconcilePending(ctx, request.ProposalID); cleanupErr != nil {
+			// Keep the warehouse record authoritative; a later lookup retries cleanup.
+			return confirmed(order), nil
+		}
 		return confirmed(order), nil
 	}
 	order, found, err := s.warehouse.FindOrderByProposal(ctx, request.ProposalID)
@@ -101,7 +109,10 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 		return contract.ConfirmResult{}, err
 	}
 	if found {
-		s.resolvePendingAfterRecordedOrder(ctx, request.ProposalID)
+		if cleanupErr := s.reconcilePending(ctx, request.ProposalID); cleanupErr != nil {
+			// Keep the warehouse record authoritative; a later lookup retries cleanup.
+			return confirmed(order), nil
+		}
 		return confirmed(order), nil
 	}
 
@@ -132,9 +143,9 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 	}
 	result, err := s.warehouse.CommitAcceptedOrder(ctx, commit)
 	if err != nil {
-		if errors.Is(err, contract.ErrInventoryUnavailable) {
+		if definiteCommitRejection(err) {
 			if resolveErr := s.store.ResolvePending(context.WithoutCancel(ctx), request.ProposalID, request.CommandID); resolveErr != nil {
-				return contract.ConfirmResult{}, errors.Join(err, fmt.Errorf("resolve pending confirmation: %w", resolveErr))
+				return contract.ConfirmResult{}, errors.Join(err, fmt.Errorf("resolve pending confirmation after definite warehouse rejection: %w", resolveErr))
 			}
 		}
 		return contract.ConfirmResult{}, err
@@ -144,8 +155,9 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 		if result.Order == nil || result.Order.ProposalID != request.ProposalID || result.Order.OrderID == "" {
 			return contract.ConfirmResult{}, errors.New("invalid committed order result")
 		}
-		if err := s.store.ResolvePending(context.WithoutCancel(ctx), request.ProposalID, request.CommandID); err != nil {
-			return contract.ConfirmResult{}, err
+		if cleanupErr := s.store.ResolvePending(context.WithoutCancel(ctx), request.ProposalID, request.CommandID); cleanupErr != nil {
+			// The recorded order is authoritative; a later lookup retries cleanup.
+			return confirmed(*result.Order), nil
 		}
 		return confirmed(*result.Order), nil
 	case contract.RecheckRequired:
@@ -178,15 +190,22 @@ func (s *OrdersService) ConfirmOrder(ctx context.Context, request contract.Confi
 	}
 }
 
-func (s *OrdersService) resolvePendingAfterRecordedOrder(ctx context.Context, proposalID string) {
+func (s *OrdersService) reconcilePending(ctx context.Context, proposalID string) error {
 	cleanupContext := context.WithoutCancel(ctx)
 	record, found, err := s.store.Get(cleanupContext, proposalID)
-	if err != nil || !found || record.PendingCommandID == "" {
-		return
+	if err != nil {
+		return err
 	}
-	if err := s.store.ResolvePending(cleanupContext, proposalID, record.PendingCommandID); err != nil {
-		return
+	if !found || record.PendingCommandID == "" {
+		return nil
 	}
+	return s.store.ResolvePending(cleanupContext, proposalID, record.PendingCommandID)
+}
+
+func definiteCommitRejection(err error) bool {
+	return errors.Is(err, contract.ErrInventoryUnavailable) ||
+		errors.Is(err, contract.ErrInvalidArgument) ||
+		errors.Is(err, contract.ErrCommandIdentityConflict)
 }
 
 func (s *OrdersService) lockProposal(proposalID string) func() {

@@ -46,7 +46,7 @@ func (r *Runtime) GetDishCatalog(ctx context.Context) (contract.DishCatalog, err
 	return r.menu.GetDishCatalog(ctx)
 }
 
-func (r *Runtime) GetDish(ctx context.Context, dishID string) (contract.Dish, error) {
+func (r *Runtime) GetDish(ctx context.Context, dishID string) (contract.DishDetails, error) {
 	return r.menu.GetDish(ctx, dishID)
 }
 

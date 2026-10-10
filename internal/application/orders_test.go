@@ -46,12 +46,104 @@ type failingResolveProposalStore struct {
 	err error
 }
 
+type resolveOnceFailureStore struct {
+	application.ProposalStore
+	proposalID string
+	err        error
+	mu         sync.Mutex
+	failed     bool
+}
+
 func (s unavailableProposalStore) Get(context.Context, string) (domain.ProposalRecord, bool, error) {
 	return domain.ProposalRecord{}, false, s.err
 }
 
 func (s failingResolveProposalStore) ResolvePending(context.Context, string, string) error {
 	return s.err
+}
+
+func (s *resolveOnceFailureStore) ResolvePending(ctx context.Context, proposalID, commandID string) error {
+	s.mu.Lock()
+	if proposalID == s.proposalID && !s.failed {
+		s.failed = true
+		s.mu.Unlock()
+		return s.err
+	}
+	s.mu.Unlock()
+	return s.ProposalStore.ResolvePending(ctx, proposalID, commandID)
+}
+
+type racingCommandWarehouse struct {
+	mu                  sync.Mutex
+	initialLookups      int
+	initialLookupsReady chan struct{}
+	recorded            map[string]contract.CommandRecord
+	ordersByProposal    map[string]contract.Order
+	firstCommitDone     chan struct{}
+	commitCalls         int
+}
+
+func newRacingCommandWarehouse() *racingCommandWarehouse {
+	return &racingCommandWarehouse{
+		initialLookupsReady: make(chan struct{}),
+		recorded:            make(map[string]contract.CommandRecord),
+		ordersByProposal:    make(map[string]contract.Order),
+		firstCommitDone:     make(chan struct{}),
+	}
+}
+
+func (*racingCommandWarehouse) EvaluateOrder(context.Context, contract.EvaluateOrderRequest) (contract.OrderEvaluation, error) {
+	return contract.OrderEvaluation{}, nil
+}
+
+func (w *racingCommandWarehouse) CommitAcceptedOrder(_ context.Context, request contract.CommitOrderRequest) (contract.CommitResult, error) {
+	if request.CommandID == "command-1" && request.ProposalID == "proposal-2" {
+		<-w.firstCommitDone
+	}
+	order := contract.Order{
+		OrderID:    "order-for-" + request.ProposalID,
+		ProposalID: request.ProposalID,
+		Positions:  append([]contract.AcceptedPosition(nil), request.AcceptedPositions...),
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.commitCalls++
+	if previous, exists := w.recorded[request.CommandID]; exists {
+		if previous.CommandFingerprint != confirmFingerprint(request.ProposalID) {
+			return contract.CommitResult{}, contract.ErrCommandIdentityConflict
+		}
+		return contract.CommitResult{Kind: contract.OrderCommitted, Order: previous.Result.Order}, nil
+	}
+	w.recorded[request.CommandID] = commandRecord(request.CommandID, request.ProposalID, order)
+	w.ordersByProposal[request.ProposalID] = order
+	if request.CommandID == "command-1" && request.ProposalID == "proposal-1" {
+		close(w.firstCommitDone)
+	}
+	return contract.CommitResult{Kind: contract.OrderCommitted, Order: &order}, nil
+}
+
+func (w *racingCommandWarehouse) FindRecordedCommand(_ context.Context, commandID string) (contract.CommandRecord, bool, error) {
+	w.mu.Lock()
+	record, found := w.recorded[commandID]
+	if commandID == "command-1" && w.initialLookups < 2 {
+		w.initialLookups++
+		if w.initialLookups == 2 {
+			close(w.initialLookupsReady)
+		}
+		ready := w.initialLookupsReady
+		w.mu.Unlock()
+		<-ready
+		return cloneCommandRecord(record), found, nil
+	}
+	w.mu.Unlock()
+	return cloneCommandRecord(record), found, nil
+}
+
+func (w *racingCommandWarehouse) FindOrderByProposal(_ context.Context, proposalID string) (contract.Order, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	order, found := w.ordersByProposal[proposalID]
+	return cloneOrder(order), found, nil
 }
 
 func newWarehouseFake() *warehouseFake {
@@ -445,6 +537,46 @@ func TestRecordedOrderRemainsAuthoritativeWhenPendingResolutionFails(t *testing.
 	}
 }
 
+func TestCommittedOrderRemainsAuthoritativeWhenImmediateCleanupFails(t *testing.T) {
+	baseStore := memory.NewProposalStore()
+	createProposal(t, baseStore, proposalFixture("proposal-1", 2))
+	storeErr := errors.New("temporary pending resolution failure")
+	store := &resolveOnceFailureStore{ProposalStore: baseStore, proposalID: "proposal-1", err: storeErr}
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
+	warehouse.commitHook = func(request contract.CommitOrderRequest) (contract.CommitResult, error) {
+		warehouse.mu.Lock()
+		warehouse.recorded[request.CommandID] = commandRecord(request.CommandID, request.ProposalID, order)
+		warehouse.ordersByProposal[request.ProposalID] = order
+		warehouse.mu.Unlock()
+		return contract.CommitResult{Kind: contract.OrderCommitted, Order: &order}, nil
+	}
+	service := newOrdersService(t, store, warehouse)
+	request := contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"}
+
+	first, err := service.ConfirmOrder(context.Background(), request)
+	if err != nil || first.Kind != contract.OrderConfirmed || first.Order == nil || first.Order.OrderID != order.OrderID {
+		t.Fatalf("first ConfirmOrder() = (%+v, %v), want committed order despite cleanup error %v", first, err, storeErr)
+	}
+	record, ok, getErr := baseStore.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "command-1" {
+		t.Fatalf("pending marker after failed cleanup = (%+v, %v, %v), want command-1", record, ok, getErr)
+	}
+
+	second, err := service.ConfirmOrder(context.Background(), request)
+	if err != nil || second.Kind != contract.OrderConfirmed || second.Order == nil || second.Order.OrderID != order.OrderID {
+		t.Fatalf("repeated ConfirmOrder() = (%+v, %v), want same committed order", second, err)
+	}
+	record, ok, getErr = baseStore.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "" {
+		t.Fatalf("pending marker after successful retry cleanup = (%+v, %v, %v), want empty", record, ok, getErr)
+	}
+	_, calls := warehouse.commits()
+	if calls != 1 {
+		t.Fatalf("repeated ConfirmOrder() committed %d times, want one", calls)
+	}
+}
+
 func TestCancelledAfterWarehouseCommit(t *testing.T) {
 	store := memory.NewProposalStore()
 	warehouse := newWarehouseFake()
@@ -593,6 +725,97 @@ func TestKnownInventoryUnavailableClearsPending(t *testing.T) {
 	record, ok, getErr := store.Get(context.Background(), "proposal-1")
 	if getErr != nil || !ok || record.PendingCommandID != "" {
 		t.Fatalf("known unavailable left pending state: (%+v, %v, %v)", record, ok, getErr)
+	}
+}
+
+func TestKnownInvalidArgumentClearsPendingAndAllowsNewCommand(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	warehouse.commitErr = contract.ErrInvalidArgument
+	service := newOrdersService(t, store, warehouse)
+	createProposal(t, store, proposalFixture("proposal-1", 1))
+
+	_, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if !errors.Is(err, contract.ErrInvalidArgument) {
+		t.Fatalf("first ConfirmOrder() error = %v, want ErrInvalidArgument", err)
+	}
+	record, ok, getErr := store.Get(context.Background(), "proposal-1")
+	if getErr != nil || !ok || record.PendingCommandID != "" {
+		t.Fatalf("known invalid argument left pending state: (%+v, %v, %v)", record, ok, getErr)
+	}
+
+	warehouse.mu.Lock()
+	warehouse.commitErr = nil
+	warehouse.commitResult = contract.CommitResult{Kind: contract.OrderCommitted, Order: &contract.Order{OrderID: "order-1", ProposalID: "proposal-1"}}
+	warehouse.mu.Unlock()
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.OrderID != "order-1" {
+		t.Fatalf("retry with valid command = (%+v, %v), want committed order", result, err)
+	}
+	requests, calls := warehouse.commits()
+	if calls != 2 || requests[0].CommandID != "command-1" || requests[1].CommandID != "command-2" {
+		t.Fatalf("commit requests = %+v, want rejected C1 then accepted C2", requests)
+	}
+}
+
+func TestConflictingCommandRaceReconcilesPendingForNextCommand(t *testing.T) {
+	baseStore := memory.NewProposalStore()
+	createProposal(t, baseStore, proposalFixture("proposal-1", 1))
+	createProposal(t, baseStore, proposalFixture("proposal-2", 1))
+	storeErr := errors.New("temporary pending resolution failure")
+	store := &resolveOnceFailureStore{ProposalStore: baseStore, proposalID: "proposal-2", err: storeErr}
+	warehouse := newRacingCommandWarehouse()
+	service, err := application.NewOrdersService(store, warehouse, func() time.Time {
+		return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow)
+	}, testsupport.NewIDs("generated-proposal-").Next)
+	if err != nil {
+		t.Fatalf("NewOrdersService() error = %v", err)
+	}
+
+	type response struct {
+		proposalID string
+		result     contract.ConfirmResult
+		err        error
+	}
+	responses := make(chan response, 2)
+	for _, proposalID := range []string{"proposal-1", "proposal-2"} {
+		proposalID := proposalID
+		go func() {
+			result, confirmErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: proposalID})
+			responses <- response{proposalID: proposalID, result: result, err: confirmErr}
+		}()
+	}
+	first := <-responses
+	second := <-responses
+	results := map[string]response{first.proposalID: first, second.proposalID: second}
+	if got := results["proposal-1"]; got.err != nil || got.result.Kind != contract.OrderConfirmed {
+		t.Fatalf("proposal-1 C1 result = (%+v, %v), want committed order", got.result, got.err)
+	}
+	if got := results["proposal-2"]; !errors.Is(got.err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("proposal-2 C1 error = %v, want ErrCommandIdentityConflict (cleanup may also fail with %v)", got.err, storeErr)
+	}
+	record, ok, getErr := baseStore.Get(context.Background(), "proposal-2")
+	if getErr != nil || !ok || record.PendingCommandID != "command-1" {
+		t.Fatalf("proposal-2 pending marker after failed cleanup = (%+v, %v, %v), want command-1", record, ok, getErr)
+	}
+
+	if _, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-2"}); !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("proposal-2 conflicting C1 retry error = %v, want ErrCommandIdentityConflict", err)
+	}
+	record, ok, getErr = baseStore.Get(context.Background(), "proposal-2")
+	if getErr != nil || !ok || record.PendingCommandID != "" {
+		t.Fatalf("proposal-2 marker after known-conflict reconciliation = (%+v, %v, %v), want empty", record, ok, getErr)
+	}
+
+	result, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-2"})
+	if err != nil || result.Kind != contract.OrderConfirmed || result.Order == nil || result.Order.ProposalID != "proposal-2" {
+		t.Fatalf("proposal-2 C2 retry = (%+v, %v), want its committed order", result, err)
+	}
+	warehouse.mu.Lock()
+	commitCalls := warehouse.commitCalls
+	warehouse.mu.Unlock()
+	if commitCalls != 3 {
+		t.Fatalf("warehouse commit calls = %d, want P1/C1, P2/C1, P2/C2", commitCalls)
 	}
 }
 

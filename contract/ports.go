@@ -12,7 +12,7 @@ type OrdersWarehouse interface {
 type CatalogWarehouse interface {
 	GetProducts(context.Context) (Products, error)
 	GetDishCatalog(context.Context) (DishCatalog, error)
-	GetDish(context.Context, string) (Dish, error)
+	GetDish(context.Context, string) (DishDetails, error)
 	RegisterProduct(context.Context, RegisterProductRequest) (Product, error)
 	DefineDish(context.Context, DefineDishRequest) (Dish, error)
 }
