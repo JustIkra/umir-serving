@@ -87,7 +87,7 @@ TZ=Europe/Moscow PORT=18082 go run ./cmd/server
 
 При запуске через Go healthz доступен на `http://127.0.0.1:18082/healthz`.
 
-`make check` проверяет форматирование, сборку, закреплённые golangci-lint/go-arch-lint и полные race-тесты с `GOWORK=off`. Версии инструментов находятся в `.go-quality-versions`, правила — в `.golangci.yml` и `.go-arch-lint.yml`. Для форматирования отдельных файлов используйте `make fmt FILES='path/to/file.go'`; список нескольких путей разделяется новой строкой. Межсервисные сценарии запускаются через `umir-checks business --local` из фабрики. Численный RPS порог этот этап не задаёт.
+`make check` проверяет форматирование, сборку, закреплённые golangci-lint/go-arch-lint и полные race-тесты с `GOWORK=off`. Архитектурная проверка исключает тесты `internal/application`, потому что они напрямую собирают memory adapters; production-код application остаётся ограничен domain и contract. Версии инструментов находятся в `.go-quality-versions`, правила — в `.golangci.yml` и `.go-arch-lint.yml`. Для форматирования отдельных файлов используйте `make fmt FILES='path/to/file.go'`; список нескольких путей разделяется новой строкой. Межсервисные сценарии запускаются через `umir-checks business --local` из фабрики. Численный RPS порог этот этап не задаёт.
 
 ## Совместимость и версии
 

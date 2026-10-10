@@ -4,6 +4,8 @@ allow:
   deepScan: false
   depOnAnyVendor: false
   ignoreNotFoundComponents: true
+excludeFiles:
+  - "^.*internal/application/.*_test\\.go$"
 components:
   domain: {in: "internal/domain/**"}
   contract: {in: "contract/**"}
@@ -19,13 +21,13 @@ deps:
   contract:
     mayDependOn: [contract]
   application:
-    mayDependOn: [application, domain, contract, adapters, testsupport]
+    mayDependOn: [application, domain, contract]
   adapters:
     mayDependOn: [adapters, application, domain, contract]
   bootstrap:
     mayDependOn: [bootstrap, application, adapters, contract]
   process:
-    mayDependOn: [process, bootstrap, contract, application]
+    mayDependOn: [process, bootstrap]
   testsupport:
     mayDependOn: [testsupport, domain, contract]
   tests:
