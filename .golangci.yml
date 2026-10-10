@@ -1,0 +1,142 @@
+version: "2"
+run:
+  tests: true
+  relative-path-mode: cfg
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - unconvert
+    - errorlint
+    - nilerr
+    - nolintlint
+    - depguard
+    - bodyclose
+    - forbidigo
+  settings:
+    errcheck:
+      check-blank: true
+      check-type-assertions: true
+      disable-default-exclusions: true
+    nolintlint:
+      allow-unused: false
+      require-specific: true
+      require-explanation: true
+    depguard:
+      rules:
+        production-boundaries:
+          list-mode: lax
+          files: ["!$test"]
+          deny:
+            - pkg: "github.com/JustIkra/umir-serving/tests/"
+              desc: "Production must not import test support."
+        cross-service-imports:
+          list-mode: lax
+          files: ["!$test"]
+          deny:
+            - pkg: "github.com/JustIkra/umir-warehouse"
+              desc: "Services communicate through explicit public contracts."
+            - pkg: "github.com/JustIkra/umir-factory"
+              desc: "Service code must not import the factory."
+        domain:
+          list-mode: strict
+          files:
+            - "**/internal/domain/*.go"
+            - "**/internal/domain/**/*.go"
+            - "!$test"
+          allow:
+            - "bytes$"
+            - "cmp$"
+            - "errors$"
+            - "crypto/sha256$"
+            - "encoding/hex$"
+            - "fmt$"
+            - "maps$"
+            - "math$"
+            - "math/bits$"
+            - "regexp$"
+            - "slices$"
+            - "sort$"
+            - "strconv$"
+            - "strings$"
+            - "time$"
+            - "unicode$"
+            - "unicode/utf8$"
+        contract:
+          list-mode: strict
+          files:
+            - "**/contract/*.go"
+            - "**/contract/**/*.go"
+            - "!$test"
+          allow:
+            - "bytes$"
+            - "cmp$"
+            - "errors$"
+            - "context$"
+            - "fmt$"
+            - "maps$"
+            - "math$"
+            - "math/bits$"
+            - "regexp$"
+            - "slices$"
+            - "sort$"
+            - "strconv$"
+            - "strings$"
+            - "time$"
+            - "unicode$"
+            - "unicode/utf8$"
+        application:
+          list-mode: strict
+          files:
+            - "**/internal/application/*.go"
+            - "**/internal/application/**/*.go"
+            - "!$test"
+          allow:
+            - "bytes$"
+            - "cmp$"
+            - "errors$"
+            - "fmt$"
+            - "maps$"
+            - "math$"
+            - "math/bits$"
+            - "regexp$"
+            - "slices$"
+            - "sort$"
+            - "strconv$"
+            - "strings$"
+            - "time$"
+            - "unicode$"
+            - "unicode/utf8$"
+            - "context$"
+            - "sync$"
+            - "sync/atomic$"
+            - "crypto/sha256$"
+            - "encoding/hex$"
+            - "encoding/json$"
+            - "github.com/JustIkra/umir-serving/internal/domain/"
+            - "github.com/JustIkra/umir-serving/internal/domain$"
+            - "github.com/JustIkra/umir-serving/contract/"
+            - "github.com/JustIkra/umir-serving/contract$"
+            - "github.com/JustIkra/umir-serving/internal/application/"
+            - "github.com/JustIkra/umir-serving/internal/application$"
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^time\.(Now|Sleep|After|AfterFunc|Tick|NewTimer|NewTicker)$'
+          msg: "Inject time and scheduling dependencies into the pure core."
+  exclusions:
+    presets: []
+    warn-unused: true
+    rules:
+      - linters: [forbidigo]
+        path-except: '^(internal/(domain|application)/|contract/)'
+      - linters: [forbidigo]
+        path: '_test\.go$'
+formatters:
+  enable:
+    - gofmt
+    - goimports

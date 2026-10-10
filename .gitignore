@@ -7,4 +7,5 @@ coverage.out
 bin/
 node_modules/
 dist/
+.cache/go-quality/
 

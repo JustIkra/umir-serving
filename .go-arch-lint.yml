@@ -1,0 +1,32 @@
+version: 3
+workdir: .
+allow:
+  deepScan: false
+  depOnAnyVendor: false
+  ignoreNotFoundComponents: true
+components:
+  domain: {in: "internal/domain/**"}
+  contract: {in: "contract/**"}
+  application: {in: "internal/application/**"}
+  adapters: {in: "internal/adapters/**"}
+  bootstrap: {in: "bootstrap/**"}
+  process: {in: "cmd/**"}
+  testsupport: {in: "tests/testsupport/**"}
+  tests: {in: "tests/**"}
+deps:
+  domain:
+    mayDependOn: [domain]
+  contract:
+    mayDependOn: [contract]
+  application:
+    mayDependOn: [application, domain, contract, adapters, testsupport]
+  adapters:
+    mayDependOn: [adapters, application, domain, contract]
+  bootstrap:
+    mayDependOn: [bootstrap, application, adapters, contract]
+  process:
+    mayDependOn: [process, bootstrap, contract, application]
+  testsupport:
+    mayDependOn: [testsupport, domain, contract]
+  tests:
+    mayDependOn: [tests, testsupport, application, adapters, domain, contract, bootstrap]

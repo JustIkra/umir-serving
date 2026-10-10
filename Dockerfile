@@ -4,6 +4,9 @@ WORKDIR /app
 COPY go.mod ./
 RUN go mod download
 COPY cmd ./cmd
+COPY contract ./contract
+COPY bootstrap ./bootstrap
+COPY internal ./internal
 ARG TARGETOS
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
