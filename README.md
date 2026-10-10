@@ -22,7 +22,7 @@
 - `internal/application` задаёт `ProposalStore` и содержит `OrdersService`, `MenuService` и `RecommendationsService`.
 - `internal/adapters/memory` содержит `ProposalStore` с копированием данных, проверкой pending identity и атомарной заменой.
 - Публичный `contract` содержит значения входов/выходов и небольшие порты `OrdersWarehouse`, `CatalogWarehouse` и `MenuWarehouse`. Serving владеет этими портами; production-код не импортирует `umir-warehouse`.
-- Публичный `bootstrap.NewInMemory` ещё предстоит добавить для сборки адаптеров и сценариев в конкретный `Runtime`.
+- Публичный `bootstrap.NewInMemory` собирает memory `ProposalStore` и application services в `Runtime`; `Options` принимает часы, генератор ID и собственные serving-порты склада. Runtime предоставляет методы задач заказов, каталога, меню, стоп-листа и рекомендаций.
 - `cmd/server` остаётся точкой запуска HTTP-каркаса. При подключении новых пакетов Dockerfile нужно обновить: сейчас в build stage копируется только `cmd`.
 
 Тестовая сборка межсервисного взаимодействия будет создана в отдельном Go-модуле фабрики `tests/business`. Её bridge будет преобразовывать serving contract DTO в контракты warehouse и вызывать warehouse bootstrap Runtime. Такая сборка проверит оба сервиса вместе без импорта чужих `internal` пакетов и без warehouse-зависимости в production-коде serving.
