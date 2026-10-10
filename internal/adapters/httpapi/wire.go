@@ -153,10 +153,16 @@ type registerProductInput struct {
 }
 
 type defineDishInput struct {
-	CommandID   string           `json:"commandID"`
-	DishID      string           `json:"dishID"`
-	Name        string           `json:"name"`
-	Ingredients []ingredientWire `json:"ingredients"`
+	CommandID   string            `json:"commandID"`
+	DishID      string            `json:"dishID"`
+	Name        string            `json:"name"`
+	Ingredients []ingredientInput `json:"ingredients"`
+}
+
+type ingredientInput struct {
+	ProductID string  `json:"productID"`
+	Quantity  string  `json:"quantity"`
+	BaseUnit  *string `json:"baseUnit,omitempty"`
 }
 
 type preparePositionInput struct {

@@ -180,7 +180,17 @@ func (h *Handler) defineDish(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, contract.ErrInvalidArgument, true)
 			return
 		}
-		recipe[index] = contract.Ingredient{ProductID: ingredient.ProductID, Quantity: quantity, BaseUnit: ingredient.BaseUnit}
+		baseUnit := ""
+		if ingredient.BaseUnit != nil {
+			switch *ingredient.BaseUnit {
+			case "g", "ml", "pcs":
+				baseUnit = *ingredient.BaseUnit
+			default:
+				h.writeError(w, contract.ErrInvalidArgument, true)
+				return
+			}
+		}
+		recipe[index] = contract.Ingredient{ProductID: ingredient.ProductID, Quantity: quantity, BaseUnit: baseUnit}
 	}
 	value, err := h.runtime.DefineDish(r.Context(), contract.DefineDishRequest{CommandID: input.CommandID, DishID: input.DishID, Name: input.Name, Recipe: recipe})
 	if err != nil {
@@ -318,6 +328,10 @@ func parseDishQuery(raw string, force bool) (string, error) {
 	}
 	key, value, found := strings.Cut(raw, "=")
 	if !found || key != "dishID" {
+		return "", contract.ErrInvalidArgument
+	}
+	query, err := url.ParseQuery(raw)
+	if err != nil || len(query) != 1 || len(query["dishID"]) != 1 {
 		return "", contract.ErrInvalidArgument
 	}
 	dishID, err := url.QueryUnescape(value)

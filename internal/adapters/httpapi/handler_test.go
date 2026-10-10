@@ -20,6 +20,8 @@ type runtimeStub struct {
 	Runtime
 	registerCalls int
 	dishCalls     int
+	defineCalls   int
+	definedDish   contract.DefineDishRequest
 	confirmResult contract.ConfirmResult
 }
 
@@ -31,6 +33,12 @@ func (r *runtimeStub) RegisterProduct(_ context.Context, _ contract.RegisterProd
 func (r *runtimeStub) GetDish(_ context.Context, dishID string) (contract.DishDetails, error) {
 	r.dishCalls++
 	return contract.DishDetails{Dish: contract.Dish{DishID: dishID, Name: "Dish", Recipe: []contract.Ingredient{}}}, nil
+}
+
+func (r *runtimeStub) DefineDish(_ context.Context, request contract.DefineDishRequest) (contract.Dish, error) {
+	r.defineCalls++
+	r.definedDish = request
+	return contract.Dish{DishID: request.DishID, Name: request.Name, Recipe: append([]contract.Ingredient(nil), request.Recipe...)}, nil
 }
 
 func (r *runtimeStub) ConfirmOrder(context.Context, contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
@@ -62,6 +70,75 @@ func TestHandlerRejectsAmbiguousDishQuery(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/dish?dishID=one&dishID=two", nil))
 	if response.Code != http.StatusBadRequest || runtime.dishCalls != 0 {
 		t.Fatalf("response = %d; runtime calls = %d", response.Code, runtime.dishCalls)
+	}
+}
+
+func TestHandlerRejectsRawSemicolonDishQueryButAcceptsEncodedID(t *testing.T) {
+	runtime := &runtimeStub{}
+	handler, err := NewHandler(runtime, Options{RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := httptest.NewRecorder()
+	handler.ServeHTTP(bad, httptest.NewRequest(http.MethodGet, "/dish?dishID=one;extra=value", nil))
+	if bad.Code != http.StatusBadRequest || runtime.dishCalls != 0 {
+		t.Fatalf("raw semicolon query response=%d calls=%d", bad.Code, runtime.dishCalls)
+	}
+	for _, query := range []string{"dishID=one%3Bextra%3Dvalue", "dishID=one%26other%3Dvalue"} {
+		good := httptest.NewRecorder()
+		handler.ServeHTTP(good, httptest.NewRequest(http.MethodGet, "/dish?"+query, nil))
+		if good.Code != http.StatusOK {
+			t.Fatalf("encoded ID query %q returned status %d", query, good.Code)
+		}
+	}
+	if runtime.dishCalls != 2 {
+		t.Fatalf("encoded ID lookups = %d, want two", runtime.dishCalls)
+	}
+	for _, target := range []string{"/dish?", "/dish?dishID=one&other=value", "/dish?dishID=one&dishID=two", "/dish?dishID=%"} {
+		bad := httptest.NewRecorder()
+		handler.ServeHTTP(bad, httptest.NewRequest(http.MethodGet, target, nil))
+		if bad.Code != http.StatusBadRequest {
+			t.Errorf("invalid query %q returned status %d", target, bad.Code)
+		}
+	}
+}
+
+func TestHandlerDistinguishesOmittedIngredientUnitFromInvalidSuppliedUnit(t *testing.T) {
+	runtime := &runtimeStub{}
+	handler, err := NewHandler(runtime, Options{RequestTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := httptest.NewRequest(http.MethodPost, "/products", strings.NewReader(`{"commandID":"c1","productID":"p1","name":"Product","baseUnit":"g"}`))
+	register.Header.Set("Content-Type", "application/json")
+	registerResponse := httptest.NewRecorder()
+	handler.ServeHTTP(registerResponse, register)
+	if registerResponse.Code != http.StatusOK || runtime.registerCalls != 1 {
+		t.Fatalf("valid product registration status=%d calls=%d", registerResponse.Code, runtime.registerCalls)
+	}
+	for _, unit := range []string{"", "kg"} {
+		body := `{"commandID":"d1","dishID":"dish1","name":"Dish","ingredients":[{"productID":"p1","quantity":"1000","baseUnit":"` + unit + `"}]}`
+		request := httptest.NewRequest(http.MethodPost, "/dishes", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || runtime.defineCalls != 0 {
+			t.Fatalf("supplied baseUnit %q: status=%d define calls=%d", unit, response.Code, runtime.defineCalls)
+		}
+	}
+	omitted := httptest.NewRequest(http.MethodPost, "/dishes", strings.NewReader(`{"commandID":"d2","dishID":"dish2","name":"Dish","ingredients":[{"productID":"p1","quantity":"1000"}]}`))
+	omitted.Header.Set("Content-Type", "application/json")
+	omittedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(omittedResponse, omitted)
+	if omittedResponse.Code != http.StatusOK || runtime.defineCalls != 1 || runtime.definedDish.Recipe[0].BaseUnit != "" {
+		t.Fatalf("omitted baseUnit: status=%d calls=%d request=%+v", omittedResponse.Code, runtime.defineCalls, runtime.definedDish)
+	}
+	explicit := httptest.NewRequest(http.MethodPost, "/dishes", strings.NewReader(`{"commandID":"d3","dishID":"dish3","name":"Dish","ingredients":[{"productID":"p1","quantity":"1000","baseUnit":"g"}]}`))
+	explicit.Header.Set("Content-Type", "application/json")
+	explicitResponse := httptest.NewRecorder()
+	handler.ServeHTTP(explicitResponse, explicit)
+	if explicitResponse.Code != http.StatusOK || runtime.defineCalls != 2 || runtime.definedDish.Recipe[0].BaseUnit != "g" {
+		t.Fatalf("valid explicit baseUnit: status=%d calls=%d request=%+v", explicitResponse.Code, runtime.defineCalls, runtime.definedDish)
 	}
 }
 
