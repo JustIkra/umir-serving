@@ -23,6 +23,7 @@ type runtimeStub struct {
 	defineCalls   int
 	definedDish   contract.DefineDishRequest
 	confirmResult contract.ConfirmResult
+	resolveErr    error
 }
 
 func (r *runtimeStub) RegisterProduct(_ context.Context, _ contract.RegisterProductRequest) (contract.Product, error) {
@@ -43,6 +44,10 @@ func (r *runtimeStub) DefineDish(_ context.Context, request contract.DefineDishR
 
 func (r *runtimeStub) ConfirmOrder(context.Context, contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
 	return r.confirmResult, nil
+}
+
+func (r *runtimeStub) ResolveConfirmation(context.Context, contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
+	return contract.ConfirmResult{}, r.resolveErr
 }
 
 func TestHandlerRejectsCaseInsensitiveRequestFieldAliasBeforeRuntime(t *testing.T) {
@@ -70,6 +75,65 @@ func TestHandlerRejectsAmbiguousDishQuery(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/dish?dishID=one&dishID=two", nil))
 	if response.Code != http.StatusBadRequest || runtime.dishCalls != 0 {
 		t.Fatalf("response = %d; runtime calls = %d", response.Code, runtime.dishCalls)
+	}
+}
+
+func TestHandlerInvalidArgumentOutcomeDependsOnOperation(t *testing.T) {
+	runtime := &runtimeStub{}
+	handler, err := NewHandler(runtime, Options{RequestTimeout: time.Second, MaxRequestBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		method  string
+		target  string
+		body    string
+		outcome string
+	}{
+		{name: "read rejection", method: http.MethodGet, target: "/products?extra=value", outcome: "unavailable"},
+		{name: "mutating rejection", method: http.MethodPost, target: "/products?extra=value", body: `{"commandID":"c1","productID":"p1","name":"Product","baseUnit":"g"}`, outcome: "not_committed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.target, strings.NewReader(test.body))
+			if test.body != "" {
+				request.Header.Set("Content-Type", "application/json")
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"outcome":"`+test.outcome+`"`) {
+				t.Fatalf("response=%d %s, want outcome %s", response.Code, response.Body.String(), test.outcome)
+			}
+		})
+	}
+	if runtime.registerCalls != 0 {
+		t.Fatalf("rejected requests called RegisterProduct %d times", runtime.registerCalls)
+	}
+}
+
+func TestHandlerResolveInvalidArgumentKeepsAttemptUnknownUnlessOwnerEstablishedRefusal(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		err     error
+		outcome string
+	}{
+		{name: "passive lookup invalid argument", err: contract.ErrInvalidArgument, outcome: "unknown"},
+		{name: "cached owner refusal", err: &contract.OperationError{Code: "InvalidArgument", Message: "owner refused confirmation", Outcome: "not_committed", Cause: contract.ErrInvalidArgument}, outcome: "not_committed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := &runtimeStub{resolveErr: test.err}
+			handler, err := NewHandler(runtime, Options{RequestTimeout: time.Second, MaxRequestBytes: 1024})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/order-confirmations/resolve", strings.NewReader(`{"commandID":"c1","proposalID":"p1"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"outcome":"`+test.outcome+`"`) {
+				t.Fatalf("response=%d %s, want outcome %s", response.Code, response.Body.String(), test.outcome)
+			}
+		})
 	}
 }
 

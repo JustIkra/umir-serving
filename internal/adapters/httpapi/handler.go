@@ -283,11 +283,19 @@ func (h *Handler) resolveConfirmation(w http.ResponseWriter, r *http.Request) { 
 
 func (h *Handler) confirm(w http.ResponseWriter, r *http.Request, resolve bool) {
 	var input confirmInput
-	if !h.decodeRequest(w, r, &input) {
+	decode := h.decodeRequest
+	if resolve {
+		decode = h.decodeResolveRequest
+	}
+	if !decode(w, r, &input) {
 		return
 	}
 	if input.CommandID == "" || input.ProposalID == "" {
-		h.writeError(w, contract.ErrInvalidArgument, true)
+		if resolve {
+			h.writeErrorWithInvalidArgumentOutcome(w, contract.ErrInvalidArgument, true, "unknown")
+		} else {
+			h.writeError(w, contract.ErrInvalidArgument, true)
+		}
 		return
 	}
 	request := contract.ConfirmOrderRequest{CommandID: input.CommandID, ProposalID: input.ProposalID}
@@ -299,12 +307,20 @@ func (h *Handler) confirm(w http.ResponseWriter, r *http.Request, resolve bool) 
 		value, err = h.runtime.ConfirmOrder(r.Context(), request)
 	}
 	if err != nil {
-		h.writeError(w, err, true)
+		if resolve {
+			h.writeErrorWithInvalidArgumentOutcome(w, err, true, "unknown")
+		} else {
+			h.writeError(w, err, true)
+		}
 		return
 	}
 	response, err := confirmToWire(value)
 	if err != nil {
-		h.writeError(w, err, true)
+		if resolve {
+			h.writeErrorWithInvalidArgumentOutcome(w, err, true, "unknown")
+		} else {
+			h.writeError(w, err, true)
+		}
 		return
 	}
 	status := http.StatusOK
@@ -315,8 +331,12 @@ func (h *Handler) confirm(w http.ResponseWriter, r *http.Request, resolve bool) 
 }
 
 func (h *Handler) requireNoQuery(w http.ResponseWriter, r *http.Request) bool {
+	return h.requireNoQueryWithOutcome(w, r, "unavailable")
+}
+
+func (h *Handler) requireNoQueryWithOutcome(w http.ResponseWriter, r *http.Request, invalidArgumentOutcome string) bool {
 	if r.URL.RawQuery != "" || r.URL.ForceQuery {
-		h.writeError(w, contract.ErrInvalidArgument, false)
+		h.writeErrorWithInvalidArgumentOutcome(w, contract.ErrInvalidArgument, invalidArgumentOutcome == "not_committed", invalidArgumentOutcome)
 		return false
 	}
 	return true
@@ -342,19 +362,27 @@ func parseDishQuery(raw string, force bool) (string, error) {
 }
 
 func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request, target any) bool {
-	if !h.requireNoQuery(w, r) {
+	return h.decodeRequestWithInvalidArgumentOutcome(w, r, target, "not_committed")
+}
+
+func (h *Handler) decodeResolveRequest(w http.ResponseWriter, r *http.Request, target any) bool {
+	return h.decodeRequestWithInvalidArgumentOutcome(w, r, target, "unknown")
+}
+
+func (h *Handler) decodeRequestWithInvalidArgumentOutcome(w http.ResponseWriter, r *http.Request, target any, invalidArgumentOutcome string) bool {
+	if !h.requireNoQueryWithOutcome(w, r, invalidArgumentOutcome) {
 		return false
 	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
-		h.writeError(w, contract.ErrInvalidArgument, true)
+		h.writeErrorWithInvalidArgumentOutcome(w, contract.ErrInvalidArgument, invalidArgumentOutcome == "not_committed", invalidArgumentOutcome)
 		return false
 	}
 	controller := http.NewResponseController(w)
 	deadline, ok := r.Context().Deadline()
 	if ok {
 		if err := controller.SetReadDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
-			h.writeError(w, contract.ErrInvalidArgument, true)
+			h.writeErrorWithInvalidArgumentOutcome(w, contract.ErrInvalidArgument, invalidArgumentOutcome == "not_committed", invalidArgumentOutcome)
 			return false
 		}
 	}
@@ -368,17 +396,25 @@ func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request, target a
 		}
 	}
 	if readErr != nil || int64(len(body)) > h.options.MaxRequestBytes {
-		h.writeError(w, contract.ErrInvalidArgument, true)
+		h.writeErrorWithInvalidArgumentOutcome(w, contract.ErrInvalidArgument, invalidArgumentOutcome == "not_committed", invalidArgumentOutcome)
 		return false
 	}
 	if err := httpjson.DecodeStrict(body, target); err != nil {
-		h.writeError(w, contract.ErrInvalidArgument, true)
+		h.writeErrorWithInvalidArgumentOutcome(w, contract.ErrInvalidArgument, invalidArgumentOutcome == "not_committed", invalidArgumentOutcome)
 		return false
 	}
 	return true
 }
 
 func (h *Handler) writeError(w http.ResponseWriter, err error, write bool) {
+	invalidArgumentOutcome := "unavailable"
+	if write {
+		invalidArgumentOutcome = "not_committed"
+	}
+	h.writeErrorWithInvalidArgumentOutcome(w, err, write, invalidArgumentOutcome)
+}
+
+func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, err error, write bool, invalidArgumentOutcome string) {
 	controller := http.NewResponseController(w)
 	if deadlineErr := controller.SetWriteDeadline(time.Now().Add(errorFlushBudget)); deadlineErr != nil && !errors.Is(deadlineErr, http.ErrNotSupported) {
 		log.Printf("serving set error write deadline: %v", deadlineErr)
@@ -405,7 +441,7 @@ func (h *Handler) writeError(w http.ResponseWriter, err error, write bool) {
 		case errors.Is(err, contract.ErrInvalidArgument):
 			value.Code = "InvalidArgument"
 			value.Message = "request contains invalid fields"
-			value.Outcome = "not_committed"
+			value.Outcome = invalidArgumentOutcome
 		case errors.Is(err, contract.ErrCommandIdentityConflict):
 			value.Code = "CommandIdentityConflict"
 			value.Message = "command identity conflicts with an existing attempt"

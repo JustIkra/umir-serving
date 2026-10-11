@@ -154,6 +154,82 @@ func TestClientTreatsUnknownRemoteErrorCodeAsUnknown(t *testing.T) {
 	}
 }
 
+func TestClientMapsInventoryUnavailableOutcomeByOperation(t *testing.T) {
+	call := map[string]func(*Client) error{
+		"read": func(client *Client) error {
+			_, err := client.GetProducts(context.Background())
+			return err
+		},
+		"register product": func(client *Client) error {
+			_, err := client.RegisterProduct(context.Background(), contract.RegisterProductRequest{CommandID: "c1", ProductID: "p1", Name: "Product", BaseUnit: "g"})
+			return err
+		},
+		"define dish": func(client *Client) error {
+			_, err := client.DefineDish(context.Background(), contract.DefineDishRequest{CommandID: "c1", DishID: "d1", Name: "Dish", Recipe: []contract.Ingredient{{ProductID: "p1", Quantity: 1000}}})
+			return err
+		},
+		"evaluate order": func(client *Client) error {
+			_, err := client.EvaluateOrder(context.Background(), contract.EvaluateOrderRequest{Positions: []contract.Position{{LineNo: 1, DishID: "d1", Portions: 1}}})
+			return err
+		},
+		"commit": func(client *Client) error {
+			_, err := client.CommitAcceptedOrder(context.Background(), structCommitRequest())
+			return err
+		},
+	}
+	for _, test := range []struct {
+		name        string
+		call        string
+		outcome     string
+		body        string
+		wantCause   bool
+		wantOutcome string
+	}{
+		{name: "read unavailable", call: "read", outcome: "unavailable", wantCause: true, wantOutcome: "unavailable"},
+		{name: "read rejects unknown", call: "read", outcome: "unknown", wantOutcome: "unavailable"},
+		{name: "register product unknown", call: "register product", outcome: "unknown", wantCause: true, wantOutcome: "unknown"},
+		{name: "define dish unknown", call: "define dish", outcome: "unknown", wantCause: true, wantOutcome: "unknown"},
+		{name: "catalog write rejects unavailable", call: "register product", outcome: "unavailable", wantOutcome: "unknown"},
+		{name: "catalog write rejects malformed", call: "define dish", body: `{`, wantOutcome: "unknown"},
+		{name: "order evaluation unavailable", call: "evaluate order", outcome: "unavailable", wantCause: true, wantOutcome: "unavailable"},
+		{name: "order evaluation rejects unknown", call: "evaluate order", outcome: "unknown", wantOutcome: "unknown"},
+		{name: "order commit preserves definite refusal", call: "commit", outcome: "not_committed", wantCause: true, wantOutcome: "not_committed"},
+		{name: "order commit preserves unknown", call: "commit", outcome: "unknown", wantCause: true, wantOutcome: "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				body := test.body
+				if body == "" {
+					body = `{"code":"InventoryUnavailable","message":"warehouse unavailable","outcome":"` + test.outcome + `"}`
+				}
+				writeResponse(t, w, body)
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, server.Client(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = call[test.call](client)
+			var operation *contract.OperationError
+			if !errors.As(err, &operation) {
+				t.Fatalf("operation error = %#v, want OperationError", err)
+			}
+			if operation.Outcome != test.wantOutcome {
+				t.Errorf("operation outcome = %q, want %q", operation.Outcome, test.wantOutcome)
+			}
+			if test.wantCause {
+				if operation.Code != "InventoryUnavailable" || !errors.Is(err, contract.ErrInventoryUnavailable) {
+					t.Errorf("operation error = %#v, want InventoryUnavailable cause", operation)
+				}
+			} else if operation.Code == "InventoryUnavailable" || errors.Is(err, contract.ErrInventoryUnavailable) {
+				t.Errorf("operation error = %#v, want rejected remote response", operation)
+			}
+		})
+	}
+}
+
 func TestClientRejectsMissingFoundDiscriminator(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

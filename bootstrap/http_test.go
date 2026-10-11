@@ -74,6 +74,7 @@ func TestNewHTTPRejectsInvalidWarehouseURLAndBudgets(t *testing.T) {
 
 func TestServingHTTPRoutesCatalogMenuOrdersAndPassiveResolve(t *testing.T) {
 	commitCalls := 0
+	commitCallsByCommand := make(map[string]int)
 	commitPendingC2 := false
 	warehouse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -103,6 +104,7 @@ func TestServingHTTPRoutesCatalogMenuOrdersAndPassiveResolve(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
+			commitCallsByCommand[body.CommandID]++
 			if body.CommandID == "c2" {
 				commitPendingC2 = true
 				w.WriteHeader(http.StatusAccepted)
@@ -130,13 +132,13 @@ func TestServingHTTPRoutesCatalogMenuOrdersAndPassiveResolve(t *testing.T) {
 	defer handler.CloseIdleConnections()
 	public := httptest.NewServer(handler)
 	defer public.Close()
-	request := func(method, path, body string) (int, string) {
+	requestWithContentType := func(method, path, body, contentType string) (int, string) {
 		req, err := http.NewRequestWithContext(context.Background(), method, public.URL+path, bytes.NewBufferString(body))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if body != "" {
-			req.Header.Set("Content-Type", "application/json")
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
 		}
 		response, err := public.Client().Do(req)
 		if err != nil {
@@ -148,6 +150,13 @@ func TestServingHTTPRoutesCatalogMenuOrdersAndPassiveResolve(t *testing.T) {
 			t.Fatal(err)
 		}
 		return response.StatusCode, string(data)
+	}
+	request := func(method, path, body string) (int, string) {
+		contentType := ""
+		if body != "" {
+			contentType = "application/json"
+		}
+		return requestWithContentType(method, path, body, contentType)
 	}
 	cases := []struct {
 		method, path, body string
@@ -177,8 +186,130 @@ func TestServingHTTPRoutesCatalogMenuOrdersAndPassiveResolve(t *testing.T) {
 			t.Errorf("%s %s body=%s, want kind %s", test.method, test.path, response, test.kind)
 		}
 	}
+	for _, test := range []struct {
+		path        string
+		body        string
+		contentType string
+	}{
+		{path: "/order-confirmations/resolve", body: `{}`},
+		{path: "/order-confirmations/resolve?extra=value", body: `{"commandID":"c1","proposalID":"p1"}`},
+		{path: "/order-confirmations/resolve", body: `{"commandID":"c1","proposalID":"p1"}`, contentType: "text/plain"},
+		{path: "/order-confirmations/resolve", body: `{"commandID":`},
+	} {
+		contentType := test.contentType
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		status, response := requestWithContentType(http.MethodPost, test.path, test.body, contentType)
+		if status != http.StatusBadRequest || !strings.Contains(response, `"outcome":"unknown"`) {
+			t.Errorf("invalid resolve %s status=%d body=%s, want unknown outcome", test.path, status, response)
+		}
+	}
+	status, response := request(http.MethodPost, "/order-confirmations/resolve", `{"commandID":"c1","proposalID":"p1"}`)
+	if status != http.StatusOK || !strings.Contains(response, `"kind":"OrderConfirmed"`) {
+		t.Errorf("valid resolve c1 status=%d body=%s, want OrderConfirmed", status, response)
+	}
 	if commitCalls != 2 {
 		t.Fatalf("warehouse commit requests = %d, want Confirm c1 and c2 only", commitCalls)
+	}
+	if commitCallsByCommand["c1"] != 1 {
+		t.Fatalf("warehouse commit requests for confirmed c1 = %d, want one sale", commitCallsByCommand["c1"])
+	}
+}
+
+func TestNewHTTPPreservesUnknownInventoryOutcomeForCatalogWrites(t *testing.T) {
+	warehouse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || (r.URL.Path != "/internal/v1/products" && r.URL.Path != "/internal/v1/dishes") {
+			t.Errorf("warehouse request = %s %s, want catalog POST", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeTestBody(t, w, `{"code":"InventoryUnavailable","message":"warehouse outcome is unknown","outcome":"unknown"}`)
+	}))
+	defer warehouse.Close()
+	_, handler, err := bootstrap.NewHTTP(bootstrap.HTTPOptions{
+		WarehouseInternalURL: warehouse.URL,
+		WarehouseTimeout:     time.Second,
+		RequestTimeout:       time.Second,
+		MaxRequestBytes:      4096,
+		Now:                  func() time.Time { return time.Date(2026, 10, 11, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60)) },
+		NewID:                func() string { return "proposal-1" },
+		HTTPClient:           warehouse.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.CloseIdleConnections()
+	public := httptest.NewServer(handler)
+	defer public.Close()
+	for _, test := range []struct {
+		path string
+		body string
+	}{
+		{path: "/products", body: `{"commandID":"register-1","productID":"p1","name":"Product","baseUnit":"g"}`},
+		{path: "/dishes", body: `{"commandID":"define-1","dishID":"d1","name":"Dish","ingredients":[{"productID":"p1","quantity":"1000"}]}`},
+	} {
+		request, err := http.NewRequest(http.MethodPost, public.URL+test.path, strings.NewReader(test.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := public.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("read/close response: %v, %v", readErr, closeErr)
+		}
+		if response.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"code":"InventoryUnavailable"`) || !strings.Contains(string(body), `"outcome":"unknown"`) {
+			t.Errorf("POST %s response=%d %s, want 503 InventoryUnavailable/unknown", test.path, response.StatusCode, body)
+		}
+	}
+}
+
+func TestNewHTTPPreservesUnavailableInventoryOutcomeForOrderPreparation(t *testing.T) {
+	warehouse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/order-evaluations" {
+			t.Errorf("warehouse request = %s %s, want POST /internal/v1/order-evaluations", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeTestBody(t, w, `{"code":"InventoryUnavailable","message":"warehouse unavailable","outcome":"unavailable"}`)
+	}))
+	defer warehouse.Close()
+	_, handler, err := bootstrap.NewHTTP(bootstrap.HTTPOptions{
+		WarehouseInternalURL: warehouse.URL,
+		WarehouseTimeout:     time.Second,
+		RequestTimeout:       time.Second,
+		MaxRequestBytes:      4096,
+		Now:                  func() time.Time { return time.Date(2026, 10, 11, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60)) },
+		NewID:                func() string { return "proposal-1" },
+		HTTPClient:           warehouse.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.CloseIdleConnections()
+	public := httptest.NewServer(handler)
+	defer public.Close()
+	request, err := http.NewRequest(http.MethodPost, public.URL+"/order-proposals", strings.NewReader(`{"positions":[{"dishID":"d1","portions":"1"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := public.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read/close response: %v, %v", readErr, closeErr)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"code":"InventoryUnavailable"`) || !strings.Contains(string(body), `"outcome":"unavailable"`) {
+		t.Fatalf("POST /order-proposals response=%d %s, want 503 InventoryUnavailable/unavailable", response.StatusCode, body)
 	}
 }
 

@@ -487,9 +487,14 @@ func decodeRemoteError(method, path string, response *http.Response, body []byte
 		}
 		cause = contract.ErrInvalidArgument
 	case "InventoryUnavailable":
-		validOutcome := value.Outcome == "unavailable"
-		if method == http.MethodPost && path == "/order-commits" {
+		validOutcome := false
+		switch {
+		case method == http.MethodGet, method == http.MethodPost && path == "/order-evaluations":
+			validOutcome = value.Outcome == "unavailable"
+		case method == http.MethodPost && path == "/order-commits":
 			validOutcome = value.Outcome == "not_committed" || value.Outcome == "unknown"
+		case method == http.MethodPost:
+			validOutcome = value.Outcome == "unknown"
 		}
 		if response.StatusCode != http.StatusServiceUnavailable || !validOutcome {
 			return exchangeError(method, errors.New("invalid InventoryUnavailable outcome"))
