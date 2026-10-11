@@ -497,6 +497,46 @@ func TestRecordedWarehouseIdentityCannotBePoisonedByFreshServingBinding(t *testi
 	}
 }
 
+func TestForeignWarehouseIdentityRejectsExistingPendingAttemptAndReleasesProposal(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 1))
+	foreignOrder := contract.Order{OrderID: "order-foreign", ProposalID: "proposal-2", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-2", foreignOrder)
+	if _, _, err := store.BeginAttempt(context.Background(), contract.ConfirmationAttempt{CommandID: "command-1", ProposalID: "proposal-1", Fingerprint: confirmFingerprint("proposal-1"), AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}, Pending: true}); err != nil {
+		t.Fatal(err)
+	}
+	service := newOrdersService(t, store, warehouse)
+	_, firstErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if !errors.Is(firstErr, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("first ConfirmOrder() error = %v, want terminal command identity conflict", firstErr)
+	}
+	attempt, found, attemptErr := store.GetAttempt(context.Background(), "command-1")
+	if attemptErr != nil || !found || attempt.State != contract.OrderAttemptRejected || attempt.Error == nil || attempt.Error.Code != "CommandIdentityConflict" || attempt.Error.Outcome != "not_committed" {
+		t.Fatalf("attempt = (%+v,%v,%v), want cached rejection", attempt, found, attemptErr)
+	}
+	proposal, proposalFound, proposalErr := store.Get(context.Background(), "proposal-1")
+	if proposalErr != nil || !proposalFound || proposal.PendingCommandID != "" || proposal.SupersededBy != "" {
+		t.Fatalf("proposal after rejection = (%+v,%v,%v), want active without pending", proposal, proposalFound, proposalErr)
+	}
+	_, retryErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	if !errors.Is(retryErr, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("exact retry error = %v", retryErr)
+	}
+	warehouse.mu.Lock()
+	warehouse.recorded = make(map[string]contract.CommandRecord)
+	warehouse.commitResult = contract.CommitResult{Kind: contract.OrderCommitted, Order: &contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}}}
+	warehouse.mu.Unlock()
+	second, secondErr := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
+	if secondErr != nil || second.Kind != contract.OrderConfirmed || second.Order == nil || second.Order.OrderID != "order-1" {
+		t.Fatalf("new C2 on active proposal = (%+v,%v)", second, secondErr)
+	}
+	_, commits := warehouse.commits()
+	if commits != 1 {
+		t.Fatalf("warehouse commits = %d, want only C2", commits)
+	}
+}
+
 func TestDifferentCommandWhilePending(t *testing.T) {
 	store := memory.NewProposalStore()
 	warehouse := newWarehouseFake()

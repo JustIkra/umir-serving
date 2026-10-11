@@ -49,6 +49,9 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 	if recordedFound {
 		order, err := recordedOrder(recorded, request.CommandID, request.ProposalID, fingerprint)
 		if err != nil {
+			if found && attempt.State == contract.OrderAttemptPending && attempt.Pending && errors.Is(err, contract.ErrCommandIdentityConflict) {
+				return contract.ConfirmResult{}, s.finishKnownError(ctx, attempt, err)
+			}
 			return contract.ConfirmResult{}, err
 		}
 		if !found {
