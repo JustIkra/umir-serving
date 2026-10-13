@@ -31,16 +31,45 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		return contract.ConfirmResult{}, err
 	}
 	if found {
+		if err := requireSavedEpoch(ctx, attempt.Context); err != nil {
+			return contract.ConfirmResult{}, err
+		}
+		if attempt.Context.Epoch != "" {
+			ctx = contract.WithWarehouseBinding(ctx, attempt.Context, true)
+		}
 		if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 			return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 		}
 		if result, terminalErr, terminal := terminalAttempt(attempt); terminal {
+			contract.RecordWarehouseContext(ctx, result.Context)
 			return result, terminalErr
 		}
 		if attempt.WarehouseResult != nil {
 			return s.completeKnownWarehouseResult(ctx, attempt, *attempt.WarehouseResult)
 		}
 	}
+
+	if found && attempt.Context.Epoch != "" {
+		return s.resolveAttempt(ctx, request, attempt)
+	}
+	proposalForScope, scopeFound, scopeErr := s.store.Get(ctx, request.ProposalID)
+	if _, scoped := contract.RequestScopeFromContext(ctx); scoped && (scopeErr != nil || !scopeFound) {
+		if scopeErr != nil {
+			return contract.ConfirmResult{}, unknownLookupError(scopeErr)
+		}
+		return contract.ConfirmResult{}, proposalNotFoundUnknown()
+	}
+	savedContext := contract.WarehouseContext{}
+	if scopeFound {
+		savedContext = attemptContext(ctx, proposalForScope.Proposal)
+		if err := requireSavedEpoch(ctx, savedContext); err != nil {
+			return contract.ConfirmResult{}, err
+		}
+		if savedContext.Epoch != "" {
+			ctx = contract.WithWarehouseBinding(ctx, savedContext, false)
+		}
+	}
+	ctx, capture := captureWarehouse(ctx)
 
 	recorded, recordedFound, err := s.warehouse.FindRecordedCommand(ctx, request.CommandID)
 	if err != nil {
@@ -61,14 +90,18 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 				accepted = toContractAcceptedPositions(proposalRecord.Proposal.AcceptedPositions)
 			}
 			attemptPending := lookupErr == nil && proposalFound && proposalRecord.PendingCommandID == request.CommandID
-			attempt, _, err = s.attempts.BeginAttempt(ctx, contract.ConfirmationAttempt{CommandID: request.CommandID, ProposalID: request.ProposalID, Fingerprint: fingerprint, AcceptedPositions: accepted, Pending: attemptPending})
+			attempt, _, err = s.attempts.BeginAttempt(ctx, contract.ConfirmationAttempt{Context: savedContext, CommandID: request.CommandID, ProposalID: request.ProposalID, Fingerprint: fingerprint, AcceptedPositions: accepted, Pending: attemptPending})
 			if err != nil {
 				return contract.ConfirmResult{}, mapAttemptStoreError(err)
 			}
 		}
-		return s.finishReadOrder(ctx, attempt, order)
+		return s.finishReadOrder(ctx, attempt, order, capture.value)
 	}
-	order, orderFound, err := s.warehouse.FindOrderByProposal(ctx, request.ProposalID)
+	var order contract.Order
+	var orderFound bool
+	if savedContext.Epoch == "" {
+		order, orderFound, err = s.warehouse.FindOrderByProposal(ctx, request.ProposalID)
+	}
 	if err != nil {
 		return contract.ConfirmResult{}, unknownLookupError(err)
 	}
@@ -80,12 +113,12 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 				accepted = toContractAcceptedPositions(proposalRecord.Proposal.AcceptedPositions)
 			}
 			attemptPending := lookupErr == nil && proposalFound && proposalRecord.PendingCommandID == request.CommandID
-			attempt, _, err = s.attempts.BeginAttempt(ctx, contract.ConfirmationAttempt{CommandID: request.CommandID, ProposalID: request.ProposalID, Fingerprint: fingerprint, AcceptedPositions: accepted, Pending: attemptPending})
+			attempt, _, err = s.attempts.BeginAttempt(ctx, contract.ConfirmationAttempt{Context: savedContext, CommandID: request.CommandID, ProposalID: request.ProposalID, Fingerprint: fingerprint, AcceptedPositions: accepted, Pending: attemptPending})
 			if err != nil {
 				return contract.ConfirmResult{}, mapAttemptStoreError(err)
 			}
 		}
-		return s.finishReadOrder(ctx, attempt, order)
+		return s.finishReadOrder(ctx, attempt, order, capture.value)
 	}
 	proposalRecord, proposalFound, err := s.store.Get(ctx, request.ProposalID)
 	if err != nil {
@@ -96,7 +129,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		accepted = toContractAcceptedPositions(proposalRecord.Proposal.AcceptedPositions)
 	}
 	if !found {
-		attempt, _, err = s.attempts.BeginAttempt(ctx, contract.ConfirmationAttempt{CommandID: request.CommandID, ProposalID: request.ProposalID, Fingerprint: fingerprint, AcceptedPositions: accepted})
+		attempt, _, err = s.attempts.BeginAttempt(ctx, contract.ConfirmationAttempt{Context: savedContext, CommandID: request.CommandID, ProposalID: request.ProposalID, Fingerprint: fingerprint, AcceptedPositions: accepted})
 		if err != nil {
 			return contract.ConfirmResult{}, mapAttemptStoreError(err)
 		}
@@ -106,18 +139,19 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	}
 	if proposalRecord.SupersededBy != "" {
-		result := contract.ConfirmResult{Kind: contract.ProposalSuperseded, SupersededBy: proposalRecord.SupersededBy}
+		result := contract.ConfirmResult{Context: capture.value, Kind: contract.ProposalSuperseded, SupersededBy: proposalRecord.SupersededBy}
 		if err := s.attempts.CompleteAttempt(ctx, request.CommandID, result, nil, nil); err != nil {
 			return contract.ConfirmResult{}, err
 		}
 		return result, nil
 	}
 	if proposalRecord.PendingCommandID != "" && proposalRecord.PendingCommandID != request.CommandID {
-		return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+		contract.RecordWarehouseContext(ctx, attempt.Context)
+		return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 	}
 	if len(proposalRecord.Proposal.AcceptedPositions) == 0 {
 		proposal := toContractProposal(proposalRecord.Proposal)
-		result := contract.ConfirmResult{Kind: contract.EmptyOrder, Proposal: &proposal}
+		result := contract.ConfirmResult{Context: capture.value, Kind: contract.EmptyOrder, Proposal: &proposal}
 		if err := s.attempts.CompleteAttempt(ctx, request.CommandID, result, nil, nil); err != nil {
 			return contract.ConfirmResult{}, err
 		}
@@ -126,7 +160,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 
 	if err := s.attempts.ReserveAttempt(ctx, request.CommandID); err != nil {
 		if errors.Is(err, errPendingMismatch) {
-			return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+			return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 		}
 		return contract.ConfirmResult{}, mapAttemptStoreError(err)
 	}
@@ -141,11 +175,12 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		}
 		switch warehouseAttempt.State {
 		case contract.OrderAttemptPending:
-			return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+			return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 		case contract.OrderAttemptCompleted:
 			if warehouseAttempt.Result == nil {
 				return contract.ConfirmResult{}, contract.ErrInventoryUnavailable
 			}
+			warehouseAttempt.Result.Context = capture.value
 			return s.completeKnownWarehouseResult(ctx, attempt, *warehouseAttempt.Result)
 		case contract.OrderAttemptRejected:
 			if warehouseAttempt.Error == nil {
@@ -159,11 +194,12 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 	}
 	commit := contract.CommitOrderRequest{CommandID: request.CommandID, ProposalID: request.ProposalID, AcceptedPositions: append([]contract.AcceptedPosition(nil), attempt.AcceptedPositions...)}
 	result, err := s.warehouse.CommitAcceptedOrder(ctx, commit)
+	result.Context = capture.value
 	if err != nil {
 		return contract.ConfirmResult{}, s.finishKnownError(ctx, attempt, err)
 	}
 	if result.Kind == contract.CommitPending {
-		return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+		return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 	}
 	return s.completeKnownWarehouseResult(ctx, attempt, result)
 }
@@ -185,6 +221,7 @@ func (s *OrdersService) completeKnownWarehouseResult(ctx context.Context, attemp
 		}
 		order := cloneContractOrder(*result.Order)
 		publicResult = confirmed(order)
+		publicResult.Context = result.Context
 	case contract.RecheckRequired:
 		if result.OrderEvaluation == nil {
 			return contract.ConfirmResult{}, unknownLookupError(errors.New("warehouse recheck result has no evaluation"))
@@ -199,7 +236,7 @@ func (s *OrdersService) completeKnownWarehouseResult(ctx context.Context, attemp
 				return contract.ConfirmResult{}, unknownCompletionError(lookupErr)
 			}
 			if !exists {
-				replacement = &domain.OrderProposal{ProposalID: saved.ProposalID, EvaluatedAt: saved.EvaluatedAt, StateVersion: saved.StateVersion, RequestedPositions: toDomainPositions(saved.RequestedPositions), AcceptedPositions: toDomainAcceptedPositions(saved.AcceptedPositions), Changes: toDomainChanges(saved.Changes)}
+				replacement = &domain.OrderProposal{Context: domainContext(saved.Context), ProposalID: saved.ProposalID, EvaluatedAt: saved.EvaluatedAt, StateVersion: saved.StateVersion, RequestedPositions: toDomainPositions(saved.RequestedPositions), AcceptedPositions: toDomainAcceptedPositions(saved.AcceptedPositions), Changes: toDomainChanges(saved.Changes)}
 			}
 		}
 		if replacement == nil {
@@ -208,14 +245,14 @@ func (s *OrdersService) completeKnownWarehouseResult(ctx context.Context, attemp
 				return contract.ConfirmResult{}, unknownCompletionError(errors.New("could not generate replacement proposal ID"))
 			}
 			evaluation := result.OrderEvaluation
-			replacement = &domain.OrderProposal{ProposalID: replacementID, EvaluatedAt: evaluation.EvaluatedAt, StateVersion: evaluation.StateVersion, RequestedPositions: domainRequestedFromContractAccepted(attempt.AcceptedPositions), AcceptedPositions: toDomainAcceptedPositions(evaluation.AcceptedPositions), Changes: toDomainChanges(evaluation.Changes)}
+			replacement = &domain.OrderProposal{Context: domainContext(result.Context), ProposalID: replacementID, EvaluatedAt: evaluation.EvaluatedAt, StateVersion: evaluation.StateVersion, RequestedPositions: domainRequestedFromContractAccepted(attempt.AcceptedPositions), AcceptedPositions: toDomainAcceptedPositions(evaluation.AcceptedPositions), Changes: toDomainChanges(evaluation.Changes)}
 			saved := toContractProposal(*replacement)
 			if err := s.attempts.RememberWarehouseResult(completionContext, attempt.CommandID, result, &saved); err != nil {
 				return contract.ConfirmResult{}, unknownCompletionError(err)
 			}
 		}
 		proposal := toContractProposal(*replacement)
-		publicResult = contract.ConfirmResult{Kind: contract.RequiresConfirmation, Proposal: &proposal}
+		publicResult = contract.ConfirmResult{Context: result.Context, Kind: contract.RequiresConfirmation, Proposal: &proposal}
 	default:
 		return contract.ConfirmResult{}, unknownLookupError(fmt.Errorf("warehouse returned unsupported commit result kind %q", result.Kind))
 	}
@@ -227,10 +264,11 @@ func (s *OrdersService) completeKnownWarehouseResult(ctx context.Context, attemp
 	if err := s.attempts.CompleteAttempt(completionContext, attempt.CommandID, publicResult, nil, replacement); err != nil {
 		return contract.ConfirmResult{}, unknownCompletionError(err)
 	}
+	contract.RecordWarehouseContext(ctx, publicResult.Context)
 	return publicResult, nil
 }
 
-func (s *OrdersService) finishReadOrder(ctx context.Context, attempt contract.ConfirmationAttempt, order contract.Order) (contract.ConfirmResult, error) {
+func (s *OrdersService) finishReadOrder(ctx context.Context, attempt contract.ConfirmationAttempt, order contract.Order, observation contract.WarehouseContext) (contract.ConfirmResult, error) {
 	if order.OrderID == "" || order.ProposalID != attempt.ProposalID {
 		return contract.ConfirmResult{}, unknownLookupError(errors.New("recorded order identity is invalid"))
 	}
@@ -238,10 +276,11 @@ func (s *OrdersService) finishReadOrder(ctx context.Context, attempt contract.Co
 		return contract.ConfirmResult{}, unknownLookupError(errors.New("recorded order composition differs from serving attempt"))
 	}
 	if attempt.State == contract.OrderAttemptPending && attempt.Pending {
-		commit := contract.CommitResult{Kind: contract.OrderCommitted, Order: &order}
+		commit := contract.CommitResult{Context: observation, Kind: contract.OrderCommitted, Order: &order}
 		return s.completeKnownWarehouseResult(ctx, attempt, commit)
 	}
 	result := confirmed(order)
+	result.Context = observation
 	if err := s.attempts.CompleteAttempt(ctx, attempt.CommandID, result, nil, nil); err != nil {
 		return contract.ConfirmResult{}, unknownCompletionError(err)
 	}
@@ -308,12 +347,27 @@ func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contrac
 	if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 		return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 	}
+	return s.resolveAttempt(ctx, request, attempt)
+}
+
+func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.ConfirmOrderRequest, attempt contract.ConfirmationAttempt) (contract.ConfirmResult, error) {
+	if err := requireSavedEpoch(ctx, attempt.Context); err != nil {
+		return contract.ConfirmResult{}, err
+	}
+	if attempt.Context.Epoch != "" {
+		ctx = contract.WithWarehouseBinding(ctx, attempt.Context, true)
+	}
 	if result, terminalErr, terminal := terminalAttempt(attempt); terminal {
+		contract.RecordWarehouseContext(ctx, result.Context)
 		return result, terminalErr
 	}
 	if attempt.WarehouseResult != nil {
 		return s.completeKnownWarehouseResult(ctx, attempt, *attempt.WarehouseResult)
 	}
+	if s.attemptReader == nil {
+		return contract.ConfirmResult{}, proposalNotFoundUnknown()
+	}
+	ctx, capture := captureWarehouse(ctx)
 	warehouseAttempt, err := s.attemptReader.FindOrderAttempt(ctx, request.CommandID, request.ProposalID)
 	if err != nil {
 		return contract.ConfirmResult{}, unknownLookupError(err)
@@ -321,15 +375,16 @@ func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contrac
 	switch warehouseAttempt.State {
 	case contract.OrderAttemptUnseen:
 		if attempt.State == contract.OrderAttemptPending && attempt.Pending {
-			return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+			return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 		}
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	case contract.OrderAttemptPending:
-		return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+		return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 	case contract.OrderAttemptCompleted:
 		if warehouseAttempt.Result == nil || warehouseAttempt.Result.Kind == contract.CommitPending {
 			return contract.ConfirmResult{}, unknownLookupError(errors.New("completed warehouse attempt has no result"))
 		}
+		warehouseAttempt.Result.Context = capture.value
 		return s.completeKnownWarehouseResult(ctx, attempt, *warehouseAttempt.Result)
 	case contract.OrderAttemptRejected:
 		if warehouseAttempt.Error == nil || warehouseAttempt.Error.Outcome != "not_committed" {
@@ -418,7 +473,9 @@ func unknownLookupError(err error) error {
 	var operation *contract.OperationError
 	if errors.As(err, &operation) {
 		value := *operation
-		value.Outcome = "unknown"
+		if value.Code != "RuntimeReset" || value.Outcome != "indeterminate" {
+			value.Outcome = "unknown"
+		}
 		return &value
 	}
 	return &contract.OperationError{Code: "InventoryUnavailable", Message: "warehouse attempt outcome is unknown", Outcome: "unknown", Cause: err}
@@ -443,4 +500,11 @@ func domainRequestedFromContractAccepted(values []contract.AcceptedPosition) []d
 		result[index] = domain.Position{LineNo: value.LineNo, DishID: value.DishID, Portions: value.Portions}
 	}
 	return result
+}
+
+func requireSavedEpoch(ctx context.Context, saved contract.WarehouseContext) error {
+	if current, ok := contract.WarehouseBindingFromContext(ctx); ok && saved.Epoch != "" && current.Context.Epoch != saved.Epoch {
+		return &contract.OperationError{Code: "RuntimeReset", Outcome: "indeterminate"}
+	}
+	return nil
 }

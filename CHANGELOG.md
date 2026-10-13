@@ -2,6 +2,36 @@
 
 ## Не выпущено
 
+- Fixed JWKS recovery at unchanged injected owner time with a separate general host retry clock. JWT and key-cache validity retain owner time; rollback and cancellation remain bounded.
+- Reject FIFO private config/credentials without a writer using nonblocking no-follow descriptor admission.
+- Reject malformed clock read/set/checkpoint responses before Go parsing, matching protocol offset ranges and nanosecond precision.
+
+- Added a test-only Serving protocol 1.1.0 server/control image as an explicit S4 binding supplement. Actual scoped process mechanisms use one controlled clock; private authenticated Unix controls provide readiness, clock compare-and-set/readback and checkpoints with bounded replay/cancellation. Production handlers remain unchanged.
+- Documented the missing distinct Serving Auth discovery credential binding. Factory/Auth integration, independent supplement review and J1/E real-service acceptance remain required.
+
+- BREAKING: the executable now serves only the private restaurant-scoped backend v2 API. Supply distinct caller transport keys, Auth discovery URL and packaged tzdata version; migrate legacy executable callers to scoped routes and captured epochs. Legacy bootstrap.NewHTTP remains an explicit library composition.
+- Added bounded authenticated Auth registry/JWKS transport, current peer readiness selection, process reconciliation and cancellation/join on shutdown. Auth remains the sole signer and durable lifecycle owner. Discovery failure preserves unknown confirmation outcomes.
+- Removed host port publication from the local Serving Compose configuration and declared required private topology variables.
+- Added process red/green tests and frozen-schema response checks for catalog, menu, stop-list, FEFO recommendations, proposals, exact confirmation/replay, epoch reset, failed discovery and signing-key readiness. J1/E real-service acceptance remains pending.
+
+- Preserve unknown confirmation outcomes during peer discovery outages, including cached replay and passive resolution. Preserve explicit reset outcomes and pre-dispatch proposal refusals.
+- Validate passive orders before recording success. Reject empty accepted positions/allocations and future order instants; recover through valid passive replies without a second commit.
+- Added Auth-only lifecycle registration/close, current-epoch readiness reconciliation, retained-handle fencing and idempotent partial cleanup without removing neighboring restaurant state.
+- Scoped proposals and confirmations retain their Warehouse epoch and captured settings. Unknown retries resolve passively; Serving/peer epoch loss returns RuntimeReset/indeterminate before a fresh commit, including cached confirmations.
+- Added frozen passive command/attempt/order-ID queries and saved-epoch headers. Scoped ConfirmationPending uses HTTP 200; the legacy handler keeps its compatibility behavior.
+- Added red/green lifecycle, lost-reply, timezone-change, restart, exact-quantity and cancellation regressions. J1/E real-service acceptance remains a separate gate.
+
+- Fixed scoped Warehouse refusal status forwarding for InvalidRequest, ServiceUnavailable, LimitExceeded, ProductConflict and DishConflict. Reject conflicting batch expiry or product units across an entire captured menu before recording context, while preserving exact quantities and equivalent instants.
+- Added restaurant-bound Warehouse v2 HTTP ports with original Auth token verification, consumer route/capability checks, epoch headers, bounded decoding and inherited request deadlines.
+- Scoped FEFO results preserve exact quantities, units, settings and explicit-offset instants; inconsistent or expired allocations and widened rechecks fail closed. Recommendations retain all tied reasons and do not reserve stock.
+- Forward verified committed expiry-preparation metadata across private Serving responses, including calculation failures; preserve downstream retryability and unknown modifying outcomes.
+- Added focused scope, credential, payload, FEFO, metadata and Ed25519 composition regressions. Passive scoped resolution and lifecycle are wired into the process.
+
+- Added an explicitly registered restaurant runtime with isolated proposal/attempt stores and tenant-bound Warehouse factory ports. No request implicitly creates a tenant.
+- Added private scoped HTTP composition with Auth Ed25519 JWT verification, Gateway transport authentication, per-route capability/operation checks and copied request scope before business dispatch.
+- Scoped results require observed Warehouse context and preserve exact metadata; missing context cannot fabricate a successful result or a definite mutation outcome.
+- Scoped handlers reject browser identity/context headers and cookies. The selected legacy handler retains its behavior. Lifecycle fencing and process cutover are implemented.
+
 - Обновлены закреплённые GitHub Actions до выпусков с поддержкой Node.js 24.
 - Обновлены минимальная версия Go и builder image до 1.26.9 для получения актуальных исправлений безопасности стандартной библиотеки.
 - Добавлены публичные contract/bootstrap, порты склада и Runtime с ProposalStore в памяти.

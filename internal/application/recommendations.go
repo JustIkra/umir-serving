@@ -33,6 +33,11 @@ func (s *RecommendationsService) GetRecommendations(ctx context.Context) (contra
 		if len(dish.Allocations) == 0 {
 			return contract.Recommendations{}, errors.New("available dish has no allocations")
 		}
+		for _, allocation := range dish.Allocations {
+			if !allocation.ExpiresAt.After(evaluation.EvaluatedAt) {
+				return contract.Recommendations{}, errors.New("available dish has an expired allocation")
+			}
+		}
 		priorityExpiresAt := dish.Allocations[0].ExpiresAt
 		for _, allocation := range dish.Allocations[1:] {
 			if allocation.ExpiresAt.Before(priorityExpiresAt) {

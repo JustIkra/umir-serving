@@ -1,6 +1,6 @@
 # umir-serving
 
-Сервис обслуживания одного ресторана.
+The executable serves the private restaurant-scoped backend v2 API. The legacy single-runtime constructors remain available for the selected assembly tests.
 
 Компоненты: OrdersService реализует подготовку и подтверждение предложений; MenuService предоставляет каталог, меню и стоп-лист; RecommendationsService ранжирует доступные блюда по фактическому распределению партий.
 
@@ -12,15 +12,90 @@
 
 ## Текущее состояние
 
-HTTP API обслуживает `GET /healthz`, каталог и меню (`/products`, `/dish-catalog`, `/dish`, `/dishes`, `/menu`, `/stop-list`, `/recommendations`), подготовку заказов (`/order-proposals`) и их подтверждение или разрешение (`/order-confirmations`, `/order-confirmations/resolve`). Контракты запросов и ответов описаны в [OpenAPI фабрики](https://github.com/JustIkra/umir-factory/blob/main/docs/api/openapi.yml).
+Legacy library HTTP API обслуживает `GET /healthz`, каталог и меню (`/products`, `/dish-catalog`, `/dish`, `/dishes`, `/menu`, `/stop-list`, `/recommendations`), подготовку заказов (`/order-proposals`) и их подтверждение или разрешение (`/order-confirmations`, `/order-confirmations/resolve`). Контракты запросов и ответов описаны в [OpenAPI фабрики](https://github.com/JustIkra/umir-factory/blob/main/docs/api/openapi.yml).
 
 Serving обращается к warehouse по внутреннему HTTP API. По умолчанию клиент использует `http://warehouse:8082`, ограничивает вызов 10 секундами и ответ 16 MiB. Он не повторяет изменяющие запросы автоматически. Публичный handler читает POST-тело не дольше общего бюджета запроса, по умолчанию 12 секунд, и принимает до 1 MiB. JSON проверяется на точные имена полей, повторные поля, `null`, неизвестные поля и второй JSON value. `GET /dish` требует ровно один параметр `dishID`; специальные символы в ID нужно percent-encode. `baseUnit` у ингредиента можно опустить; если он есть, допустимы только `g`, `ml` и `pcs`. Int64 передаётся десятичной строкой, а время использует `+03:00`. Ошибка `InvalidArgument` возвращает `unavailable` для GET, `not_committed` для отклонённого POST и `unknown` для отклонённого Resolve, если владелец ещё не установил терминальный исход. Warehouse `InventoryUnavailable/unknown` сохраняется для catalog POST; POST `/order-proposals` сохраняет `InventoryUnavailable/unavailable` от чтения оценки; GET принимает только `unavailable`, а `not_committed` допускается только для отказа владельца на order commit.
 
-`OrdersService` сохраняет предложения и попытки в памяти одного процесса serving. Один commandID глобально связывается с proposalID и принятым составом. Завершённый ответ повторяется точно; неизвестный исход остаётся pending; resolve только читает warehouse и никогда не начинает оформление. Если proposal отсутствует и чтения склада не установили исход, Confirm и Resolve возвращают `ProposalNotFound` с `outcome=unknown`. Перезапуск процесса удаляет его локальные предложения и попытки.
+`OrdersService` сохраняет предложения и попытки в памяти одного процесса serving. В пределах одного Runtime commandID глобально связывается с proposalID и принятым составом. Завершённый ответ повторяется точно; неизвестный исход остаётся pending; resolve только читает warehouse и никогда не начинает оформление. Если proposal отсутствует и чтения склада не установили исход, Confirm и Resolve возвращают `ProposalNotFound` с `outcome=unknown`. Перезапуск процесса удаляет его локальные предложения и попытки.
 
-`bootstrap.NewInMemory` собирает Runtime с пустым ProposalStore и переданными serving-портами склада. `bootstrap.NewHTTP` создаёт warehouse-клиент, Runtime и публичный handler для процесса. `Options` требует Now, NewID и все три складских порта. `MenuService` строит меню и стоп-лист из складских оценок. `RecommendationsService` ранжирует доступные блюда по срокам фактически используемых партий и возвращает причины с количеством на порцию.
+`bootstrap.NewInMemory` собирает Runtime с пустым ProposalStore и переданными serving-портами склада. `bootstrap.NewHTTP` сохраняет legacy warehouse-клиент, Runtime и handler для явной совместимой сборки. Процесс использует `bootstrap.NewProcessHTTP` и private v2 registry. `Options` требует Now, NewID и все три складских порта. `MenuService` строит меню и стоп-лист из складских оценок. `RecommendationsService` ранжирует доступные блюда по срокам фактически используемых партий и возвращает причины с количеством на порцию.
 `GetDish` возвращает `contract.DishDetails`: `EvaluatedAt`, `StateVersion` и вложенный `Dish`. MenuService сохраняет метаданные захвата склада и копирует рецепт.
 Часовой пояс — `Europe/Moscow`; количество ингредиентов хранится целыми тысячными базовой единицы.
+
+## Restaurant registry and trusted HTTP scope (S1)
+
+`bootstrap.NewHTTP` retains the legacy routes and Warehouse transport as an explicit library composition. The executable uses `bootstrap.NewProcessHTTP`; it never attaches the unscoped handler to the backend v2 topology.
+
+For the new topology, compose `bootstrap.NewRegistry` with an injected UUIDv4 Serving epoch, clock, ID generator and `WarehouseClientFactory`. Register each restaurant explicitly with its org, operation ID, expected epoch and lifecycle version. Registration builds one proposal/attempt store and separate Orders, Menu and Recommendations services. An identical registration keeps the runtime. A changed registration conflicts. Reads and writes never create a restaurant. Command and proposal identities are local to one restaurant runtime. A retained runtime requires its matching request scope and capability on every method.
+
+Compose `bootstrap.NewJWTVerifier` with an injected clock and read-only signing-key source, then `bootstrap.NewScopedHTTP` with the registry, verifier, Gateway transport key, request budget and body limit (at most 1 MiB). Keep this handler on an unpublished private listener. Off the isolated test network, use TLS and validate certificates and hostnames. The key source resolves only trusted Auth Ed25519 public keys by kid; it must report key discovery failures and unknown keys. Serving has no signing key. `NewProcessHTTP` supplies bounded, authenticated Auth JWKS discovery.
+
+The scoped handler accepts only `/internal/serving/v2/r/{restaurantID}/` products, dish-catalog, dish, menu, stop-list, recommendations, order-proposals, order-confirmations and passive GET order-confirmations/resolve. It checks the per-caller transport secret, Auth-only EdDSA signature, exact issuer/audiences, user/session/version claims, 60-second lifetime, operation, tenant and effective capability before runtime resolution. Forged browser identity headers and cookies fail before business work. Auth supplies the capability union for the selected restaurant; Serving does not derive rights from role headers. Health is separate and does not resolve a tenant. Every protected response is no-store.
+
+The request context carries a copied `contract.RequestScope`, including the original Auth token for the scoped downstream client. A scoped Warehouse adapter must call `contract.RecordWarehouseContext` with the verified response org/tenant/epoch/settings, evaluatedAt and exact stateVersion. Each HTTP request has its own synchronized observation collector. Successful responses carry ServingContext and the original typed result. Missing or mismatched observed context yields RuntimeNotReady; a modifying request retains outcome=unknown. No time or version is invented. Proposal responses include the selected Warehouse epoch.
+
+The registry, scoped Warehouse transport, lifecycle boundary and process composition implement the frozen backend v2 protocol. Unit transport doubles do not prove joint-service or public API acceptance. Factory J1/E checks remain required before selecting the candidate for an assembly.
+
+## Scoped Warehouse HTTP ports (S2)
+
+Use `bootstrap.NewScopedWarehouseHTTPPorts` inside the registry's Warehouse factory. Supply the selected restaurant ID, acknowledged Warehouse epoch, private URL, Serving-to-Warehouse transport key, request timeout and the same trusted Auth JWT verifier used by the scoped handler. The timeout must be positive and at most five seconds. The verifier must validate both Serving and Warehouse audiences. Each call revalidates the original token and matches its actor, tenant, operation, permissions, settings and lifecycle to the copied request scope. The adapter forwards the original token and the separate Serving transport key. It does not mint credentials.
+
+The adapter supports scoped product/dish reads, menu evaluation, order evaluation, order commit and passive command/order/attempt reads. It uses the selected restaurant in the frozen private v2 route and supplies the saved Warehouse epoch for POST and passive resolution GET. Consumer permissions are paired with the original public operation. Catalog writes, delivery, stock and final writeoff cannot dispatch through this client. POST bodies are bounded to 1 MiB and responses to 16 MiB. Parent deadlines are preserved. Redirects and automatic modifying retries are disabled. Product/dish query IDs are encoded once.
+
+Successful responses require matching org, tenant, Warehouse epoch and captured settings. Result time/version must agree with the envelope. Quantities remain exact int64 values and units remain g, ml or pcs. The v2 decoder accepts explicit RFC3339 offsets, including Z, without recomputing stored instants. The selected legacy decoder still requires +03:00. Menu allocations must be usable at the captured evaluation instant. Recommendations keep every reason at the actual minimum expiry, including ties, and never reserve stock. Evaluation and recheck responses must match the requested immutable positions.
+
+Across one captured menu, each product has one base unit and each product/batch pair has one expiry instant. Contradictory metadata fails before recording Warehouse context. Different dishes may allocate different quantities from the same batch. Equivalent timestamp offsets identify the same instant. Serving preserves the HTTP status, code, outcome and retryability of every refusal accepted by the scoped Warehouse decoder, including input errors, conflicts, capacity limits and temporary unavailability.
+
+Verified expiry-preparation headers pass through the private Serving response on success and calculation failure. They retain the committed version, Warehouse epoch and invalidation flag for the authenticated restaurant. A malformed modifying reply remains unknown; a GET protocol failure is unavailable. This metadata does not confirm final writeoff. Gateway owns removal of these private headers at the browser boundary.
+
+Captured provenance and lifecycle fencing are wired into the executable. Unit/contract tests use synthetic Warehouse transport and real local Ed25519 validation; joint real-service acceptance remains J1/E work. Product and dish ID suggestions belong to Warehouse: `GET /internal/warehouse/v2/r/{restaurantID}/id-suggestions?kind=product|dish`, with catalog.write authorization. Serving has no suggestion or catalog-write route and grants no Warehouse access through menu.read.
+
+
+## Epoch reset and lifecycle fencing (S3)
+
+Configure a distinct Auth transport key and an explicit packaged tzdata version in `ScopedHTTPOptions.AuthKey` and `TZDataVersion`. The private `GET /internal/serving/v2/runtime` reports the injected process epoch, reconciliation readiness and tzdata version. Auth and Gateway transport credentials can inspect this status. Only Auth's transport key plus its signed `service:auth` token can use `PUT` or `DELETE /internal/serving/v2/r/{restaurantID}/registry`. The token must target only Serving and match the lifecycle operation, restaurant, generation and expected epoch. Registration requires the frozen settings object. Close forbids it. Replies identify the restaurant, Serving epoch and lifecycle generation explicitly.
+
+Auth owns durable registration/deletion intents and startup retries. It installs current-epoch runtimes through registration. After receiving a complete bounded Auth registry, composition passes its validated projection to `Registry.Reconcile`. The projection carries the registry revision, entries and tombstones. Reconciliation checks that active generations are installed and deleting/deleted generations are closed. It does not create or remove runtimes from a missing or partial registry. Readiness remains false on validation failure. The HTTP status alone is not proof that Auth has acknowledged every service for a restaurant. Auth's current-epoch handshake governs business access.
+
+Close serializes with registration and runtime admission. It retains an epoch-local deletion marker immediately, cancels admitted work and waits for completion before reporting closed. A deadline can leave cleanup pending. Retry the identical operation/epoch/generation to finish cleanup. A retained handle cannot admit another operation after the marker. Neighboring restaurant stores remain independent. Local markers last for this epoch; persistent Auth tombstones restore the cutoff after restart. Auth never reconstructs proposals, stock or unknown attempts.
+
+The scoped HTTP resolver captures current Warehouse ports from the injected factory for each request. The factory must return tenant-bound ports for a currently acknowledged peer epoch within the caller's deadline. Proposals retain the actual observed Warehouse epoch and settings. Confirmations keep that epoch, immutable accepted positions and the settings used by their first attempt. A retained unknown scoped confirmation uses passive lookup only. An unseen result in the same epoch cannot authorize another commit. A changed command/proposal identity conflicts. Fresh commands receive current verified settings; owner refusals such as SettingsChanged remain explicit. Signed current credentials authorize resolution but do not replace the saved interpretation.
+
+Peer discovery failure cannot establish the outcome of an earlier confirmation. Confirmation and passive resolution return `unknown` when discovery fails or returns invalid ports; an explicit peer reset remains `indeterminate`. This conservative result applies before the resolver can inspect local attempt identity. Fresh proposal admission keeps its pre-dispatch refusal semantics. Passive command, order and completed-attempt replies use the same order validation as scoped commits: accepted positions and allocations must be nonempty, and placedAt cannot exceed the verified envelope instant. Malformed passive replies leave the retained attempt unknown and cannot cache a confirmed order. A later valid passive reply can finish the same attempt without another commit.
+
+Serving epoch mismatch is checked after scope validation and before peer discovery or ID lookup. A proposal/attempt whose saved Warehouse epoch differs from the currently captured peer epoch returns `RuntimeReset/indeterminate`, including a locally cached completed confirmation. An actual downstream reset retains that outcome through confirmation and passive resolution. Empty state after restart is not evidence of an old success or refusal. A new operation can capture a new peer epoch; an old operation cannot. Terminal replay and replacement proposals retain the original observed metadata and exact quantities. The legacy single-runtime API retains its compatibility behavior; scoped ConfirmationPending uses the frozen HTTP 200 result.
+
+The frozen consumer order query takes `orderID`. The concrete client exposes `FindOrderByID` for that route. Scoped confirmation resolves by command and attempt, then relies on the owner's atomic proposal identity check. It never sends the legacy proposalID query to the v2 order route. `FindOrderByProposal` remains a legacy port and refuses scoped dispatch.
+
+## Scoped process composition and migration
+
+`cmd/server` creates a fresh UUIDv4 epoch and calls `bootstrap.NewProcessHTTP`. Supply all four distinct transport keys, a private Auth URL and the packaged timezone data version. Configuration errors stop startup. Serving loads bundled IANA data and never signs identity tokens. Health reports process liveness; authenticated runtime status reports reconciliation readiness separately.
+
+The process starts one cancellable registry reader. Each attempt has a five-second upper bound. It validates the complete Auth registry, restaurant/service association, generations, tombstones and signing-key discovery before marking reconciliation ready. Failure clears readiness and retries with 1/2/4/8/16/30-second delays, capped by the configured polling interval. Successful reads repeat at that interval (default 30 seconds). Missing or partial documents never create an empty successful registry or delete a runtime. Auth alone sends signed registration/close requests and owns durable intents and acknowledgments. The process does not synthesize lifecycle operation IDs or install restaurants from a snapshot.
+
+Each authenticated business request obtains the selected Warehouse epoch from a fresh bounded Auth registry read. The restaurant must have ready Warehouse and current Serving acknowledgments with the same generation. Registration can use a ready Warehouse acknowledgment while Serving is still registering. Failed discovery preserves unknown confirmation outcomes; no discovery or reconciliation retry dispatches a commit. Shutdown cancels and joins the registry reader before closing idle HTTP connections.
+
+JWKS discovery accepts at most three unique OKP/Ed25519/EdDSA public keys. Known keys are copied from a cache refreshed every 30 seconds of the injected owner clock. JWT validity uses that same owner clock. Failed or stale-key discovery attempts are throttled for one second by host mechanism time, independently of owner time. The Auth client defaults to monotonic `time.Now` samples and supports a separate general retry-clock dependency. A backward mechanism sample resets the throttle interval; it does not permit an immediate retry. An unknown kid gets one refresh per cache interval; repeated misses fail closed. Unknown-key tracking is bounded. Failed refresh cannot substitute an expired cache for readiness. Discovery responses are strict JSON, bounded to 16 MiB, inherit caller deadlines and never follow redirects.
+
+Migrate callers to `/internal/serving/v2/r/{restaurantID}/...` with the Gateway transport key, Auth-signed token and agreed operation/capabilities. Unsafe requests carry the Serving epoch header. Passive resolution is GET with commandID, proposalID and the saved Serving runtimeEpoch query parameter. Results include ServingContext, the saved Warehouse epoch and decimal-string quantities/versions. The executable rejects legacy unscoped routes. Existing selected images/pins and explicit legacy library tests remain independent.
+
+Business proposals, attempts and local deletion markers exist only in memory. After restart, Auth must register active restaurants at the new epoch and reapply durable tombstones. Old confirmation identities remain RuntimeReset/indeterminate; empty state never proves rejection, success or permission to recommit. The process does not recover stock, proposals or unknown attempts. Real Auth/Warehouse/Gateway/Serving/Feedback assembly and public API acceptance remain separate Factory J1/E gates.
+
+## Operational test fixture (SI supplement to S4)
+
+The test-only [Serving fixture binding](tests/fixtures/protocol/README.md) defines protocol 1.1.0 server/control binaries and the separate tests/fixtures/Dockerfile. It composes the actual NewProcessHTTP, registry/JWKS/Warehouse clients, scoped handlers and memory runtimes with one injected clock. Its authenticated Unix controls do not appear on the production HTTP handler.
+
+Supported controls are readiness, clock read/set and checkpoint. Other owner operations fail closed. Private readers use nonblocking no-follow opens and admit only bounded regular files with the expected owner and 0600 mode before reading. The helper validates read/set/checkpoint instants against the server grammar: years 2000–2099, explicit offsets (hours 00–23 and minutes 00–59), and optional dot fractions of one through nine digits. Credentials/config remain in private 0600 files, the socket is 0600 in a 0700 directory, and controls have finite request, concurrency and replay bounds. Process instance and business epoch are fresh on restart; real Auth reconciliation determines readiness. No fixture business state, signing or persistence replacement is supplied.
+
+The independently approved operator binding correction requires exactly serving-auth, auth-serving, gateway-serving and serving-warehouse in the service credential map, plus fixture-serving as the separate control reference. The wrapper enforces that map and five distinct private credential values. Factory correction and actual Auth provisioning remain pending before J1. Fixture unit/composition checks and a missing-peer Docker smoke do not establish real-service acceptance. Accepted S4 review remains historical; this supplement requires fresh independent review.
+
+### Isolated owner catalog amendment
+
+The test wrapper also accepts a separate authenticated POST /owner-profile/v1 on its Unix socket. Send the strict CatalogRequest with action catalog-report, project, requestID, expectedInstanceID and expectedGeneration. The amendment is umir-owner-profiles/0.1.0-unpublished. Run /fixture-control profile --request /run/umir-fixtures/profile-request.json; the fixed request file must be private, owned by the fixture user and mode 0600. No profile selector or additional credential is accepted. RPC 1.1.0 capabilities and ordinary serve/healthcheck commands stay unchanged. Serving has no missing-data profile; Warehouse owns that refusal.
+
+Build with docker build -f tests/fixtures/Dockerfile --target runtime. The build pins Go 1.26.9 by image digest, parses its actual time/tzdata AST string constant, verifies equality with its zoneinfo.zip, and checks the compiled fixture executable's build identity and time/tzdata symbol. The scratch image contains the immutable archive and provenance at /usr/local/lib/umir/zoneinfo.zip and catalog-provenance.json. Provenance binds toolchain image/source, executable digest, archive digest/size and go1.26.9-embedded. The read-only helper verifies those bytes, ZIP parsing and Europe/Moscow data before returning a report. A ZONEINFO override, wrong provenance, missing archive, unavailable real runtime, stale instance or generation fails closed. Reports use the existing owner clock and config digest. Qualification must additionally inspect the image filesystem and mounts to exclude host/system/GOROOT timezone sources. A report alone does not establish BE-E4-16 or J1/E acceptance.
+
+The Feedback discovery amendment leaves Serving's four service references and separate fixture-serving credential unchanged. It grants Serving no feedback-auth credential or new Auth permission.
 
 ## Структура бизнес-ядра
 
@@ -30,7 +105,7 @@ Serving обращается к warehouse по внутреннему HTTP API. 
 - Публичный `contract` содержит значения входов/выходов и узкие порты склада, включая отдельный пассивный `OrderAttemptReader`. Serving владеет этими портами; production-код не импортирует `umir-warehouse`.
 - `internal/adapters/warehousehttp` реализует складские порты; `internal/adapters/httpapi` кодирует публичный HTTP API; `internal/adapters/httpjson` проверяет точную форму JSON.
 - Публичный `bootstrap.NewInMemory` собирает memory `ProposalStore` и application services в `Runtime`; `Options` принимает часы, генератор ID и собственные serving-порты склада. Runtime предоставляет методы задач заказов, каталога, меню, стоп-листа и рекомендаций.
-- `cmd/server` собирает HTTP-клиент, Runtime и handler через `bootstrap.NewHTTP`. Build stage Dockerfile копирует `cmd`, `contract`, `bootstrap` и `internal`; тестовая поддержка в образ не копируется.
+- `cmd/server` собирает private v2 registry, Auth discovery и scoped handler через `bootstrap.NewProcessHTTP`. Build stage Dockerfile копирует `cmd`, `contract`, `bootstrap` и `internal`; тестовая поддержка в образ не копируется.
 
 Тестовая сборка межсервисного взаимодействия находится в отдельном Go-модуле фабрики `tests/business`. Её bridge преобразует serving contract DTO в контракты warehouse и вызывает warehouse bootstrap Runtime. Она связывает оба сервиса в одном тестовом процессе без импорта чужих `internal` пакетов. Production serving не зависит от Go-модуля warehouse.
 
@@ -86,12 +161,13 @@ ProposalStore и attempt index существуют только в памяти
 
 ```sh
 make tools
-make check
+GOWORK=off make check
+GOWORK=off make quality-test
+GOWORK=off go mod verify
 GOWORK=off go vet ./...
-TZ=Europe/Moscow PORT=18082 WAREHOUSE_INTERNAL_URL=http://127.0.0.1:18084 WAREHOUSE_TIMEOUT=10s REQUEST_TIMEOUT=12s MAX_REQUEST_BYTES=1048576 go run ./cmd/server
 ```
 
-Укажите адрес warehouse internal listener в `WAREHOUSE_INTERNAL_URL`. В общей сборке фабрики это `http://warehouse:8082`; при локальном запуске warehouse задайте его `INTERNAL_PORT=18084`. Для локальной проверки healthz доступен на `http://127.0.0.1:18082/healthz`; бизнес-запросы требуют работающего warehouse.
+Configure the required private endpoints and transport credentials below through the test topology. Then run `GOWORK=off go run ./cmd/server` on that private network. Keep the listener unpublished. `GET /healthz` is liveness only; use authenticated `/internal/serving/v2/runtime` to observe reconciliation. Business requests require Auth installation and current peer readiness.
 
 `make check` проверяет форматирование, сборку, закреплённые golangci-lint/go-arch-lint и полные race-тесты с `GOWORK=off`. Архитектурная проверка исключает тесты `internal/application`, потому что они напрямую собирают memory adapters; production-код application остаётся ограничен domain и contract. Версии инструментов находятся в `.go-quality-versions`, правила — в `.golangci.yml` и `.go-arch-lint.yml`. Для форматирования отдельных файлов используйте `make fmt FILES='path/to/file.go'`; список нескольких путей разделяется новой строкой. Межсервисные сценарии запускаются через `umir-checks business --local` из фабрики. Численный RPS порог этот этап не задаёт.
 
@@ -101,22 +177,25 @@ TZ=Europe/Moscow PORT=18082 WAREHOUSE_INTERNAL_URL=http://127.0.0.1:18084 WAREHO
 
 Используется SemVer. До 1.0 совместимые исправления получают patch, новые возможности или несовместимые изменения — minor с описанием миграции. После 1.0 несовместимые изменения требуют major. Изменения записываются в CHANGELOG под «Не выпущено» до выпуска. Теги корневого модуля имеют вид `vX.Y.Z`; уже выпущенные теги не изменяются. Образы и сборка фабрики сохраняют точные SHA.
 
-Сборка отдельного контейнера:
+The local Compose file builds only Serving. It exposes port 8080 to its private network and publishes no host port. Configure the required variables and attach it to the isolated Auth/Warehouse test topology. Standalone Serving without those peers cannot pass business readiness. Validate configuration with `docker compose config --quiet`; container build and real-service acceptance remain Factory gates.
 
-```sh
-docker compose up --build -d --wait
-```
-
-Локальный Compose публикует тот же порт 18082 и не включает warehouse. Бизнес-запросы требуют доступный warehouse URL. В общей сборке фабрики serving доступен внутри сети на `serving:8080`; internal listener warehouse не публикуется на host.
-
-| Настройка | Значение в контейнере |
+| Setting | Default / requirement |
 | --- | --- |
-| `PORT` | `8080` |
-| `TZ` | `Europe/Moscow` |
+| `PORT` | `8080` on the private listener |
+| `AUTH_INTERNAL_URL` | Required private Auth origin |
 | `WAREHOUSE_INTERNAL_URL` | `http://warehouse:8082` |
+| `SERVING_AUTH_KEY` | Required Serving → Auth transport key |
+| `AUTH_RUNTIME_KEY` | Required Auth → Serving transport key |
+| `GATEWAY_SERVING_KEY` | Required Gateway → Serving transport key |
+| `SERVING_WAREHOUSE_KEY` | Required Serving → Warehouse transport key |
+| `TZDATA_VERSION` | Required packaged version, matching all peer containers |
+| `AUTH_TIMEOUT` | `5s`; positive, at most five seconds |
+| `WAREHOUSE_TIMEOUT` | `5s`; positive, at most five seconds |
 | `REQUEST_TIMEOUT` | `12s` |
-| `WAREHOUSE_TIMEOUT` | `10s` |
-| `MAX_REQUEST_BYTES` | `1048576` |
+| `REGISTRY_POLL_INTERVAL` | `30s`; positive, at most 30 seconds |
+| `MAX_REQUEST_BYTES` | `1048576`; positive, at most 1 MiB |
+
+Do not reuse one key across caller pairs. URLs must be private trusted endpoints; Auth takes an origin without a path. Use certificate/hostname-validated TLS outside the isolated test network. No secret value belongs in source or logs. Programmatic `ProcessHTTPOptions` exposes the same configuration plus injected epoch, clock, ID source and optional HTTP client.
 
 Общая сборка и команды запуска описаны в [README фабрики](https://github.com/JustIkra/umir-factory#readme).
 

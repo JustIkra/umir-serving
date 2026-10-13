@@ -146,6 +146,8 @@ type DishEvaluation struct {
 }
 
 type OrderProposal struct {
+	Context            WarehouseContext
+	WarehouseEpoch     string
 	ProposalID         string
 	EvaluatedAt        time.Time
 	StateVersion       int64

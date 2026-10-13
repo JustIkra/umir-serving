@@ -60,6 +60,7 @@ func (s *OrdersService) PrepareOrder(ctx context.Context, request contract.Prepa
 		}
 		positions[i] = contract.Position{LineNo: i + 1, DishID: position.DishID, Portions: position.Portions}
 	}
+	ctx, capture := captureWarehouse(ctx)
 	evaluation, err := s.warehouse.EvaluateOrder(ctx, contract.EvaluateOrderRequest{Positions: positions})
 	if err != nil {
 		return contract.OrderProposal{}, err
@@ -69,6 +70,7 @@ func (s *OrdersService) PrepareOrder(ctx context.Context, request contract.Prepa
 		return contract.OrderProposal{}, contract.ErrInvalidArgument
 	}
 	proposal := domain.OrderProposal{
+		Context:            domainContext(capture.value),
 		ProposalID:         proposalID,
 		EvaluatedAt:        evaluation.EvaluatedAt,
 		StateVersion:       evaluation.StateVersion,
@@ -186,6 +188,7 @@ func toDomainChanges(changes []contract.Change) []domain.Change {
 func toContractProposal(proposal domain.OrderProposal) contract.OrderProposal {
 	proposal = proposal.Clone()
 	result := contract.OrderProposal{
+		Context: contractContext(proposal.Context), WarehouseEpoch: proposal.Context.Epoch,
 		ProposalID:         proposal.ProposalID,
 		EvaluatedAt:        proposal.EvaluatedAt,
 		StateVersion:       proposal.StateVersion,
@@ -210,4 +213,35 @@ func cloneContractOrder(order contract.Order) contract.Order {
 	order.Positions = append([]contract.AcceptedPosition(nil), order.Positions...)
 	order.Allocations = append([]contract.Allocation(nil), order.Allocations...)
 	return order
+}
+
+type capturedWarehouse struct {
+	parent context.Context
+	value  contract.WarehouseContext
+}
+
+func (c *capturedWarehouse) Record(value contract.WarehouseContext) {
+	c.value = value
+	contract.RecordWarehouseContext(c.parent, value)
+}
+func (c *capturedWarehouse) RecordPreparation(value contract.WarehousePreparation) {
+	contract.RecordWarehousePreparation(c.parent, value)
+}
+func captureWarehouse(ctx context.Context) (context.Context, *capturedWarehouse) {
+	capture := &capturedWarehouse{parent: ctx}
+	return contract.WithWarehouseObserver(ctx, capture), capture
+}
+func domainContext(value contract.WarehouseContext) domain.ProposalContext {
+	return domain.ProposalContext{OrgID: value.OrgID, TenantID: value.TenantID, Epoch: value.Epoch, TimeZone: value.TimeZone, SettingsVersion: value.SettingsVersion, EvaluatedAt: value.EvaluatedAt, StateVersion: value.StateVersion}
+}
+func contractContext(value domain.ProposalContext) contract.WarehouseContext {
+	return contract.WarehouseContext{OrgID: value.OrgID, TenantID: value.TenantID, Epoch: value.Epoch, TimeZone: value.TimeZone, SettingsVersion: value.SettingsVersion, EvaluatedAt: value.EvaluatedAt, StateVersion: value.StateVersion}
+}
+func attemptContext(ctx context.Context, proposal domain.OrderProposal) contract.WarehouseContext {
+	value := contractContext(proposal.Context)
+	if scope, ok := contract.RequestScopeFromContext(ctx); ok && value.Epoch != "" {
+		value.TimeZone = scope.TimeZone
+		value.SettingsVersion = scope.SettingsVersion
+	}
+	return value
 }

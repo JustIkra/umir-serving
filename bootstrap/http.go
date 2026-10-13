@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -22,11 +23,19 @@ type HTTPOptions struct {
 type HTTPHandler struct {
 	handler http.Handler
 	client  *http.Client
+	stop    context.CancelFunc
+	done    <-chan struct{}
 }
 
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.handler.ServeHTTP(w, r) }
 
-func (h *HTTPHandler) CloseIdleConnections() { h.client.CloseIdleConnections() }
+func (h *HTTPHandler) CloseIdleConnections() {
+	if h.stop != nil {
+		h.stop()
+		<-h.done
+	}
+	h.client.CloseIdleConnections()
+}
 
 func NewHTTP(options HTTPOptions) (*Runtime, *HTTPHandler, error) {
 	if options.RequestTimeout <= 0 || options.WarehouseTimeout <= 0 || options.MaxRequestBytes <= 0 || options.Now == nil || options.NewID == nil {

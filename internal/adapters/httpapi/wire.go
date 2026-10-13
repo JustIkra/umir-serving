@@ -47,6 +47,7 @@ type changeWire struct {
 }
 
 type proposalWire struct {
+	WarehouseEpoch     string         `json:"warehouseEpoch,omitempty"`
 	ProposalID         string         `json:"proposalID"`
 	EvaluatedAt        string         `json:"evaluatedAt"`
 	StateVersion       string         `json:"stateVersion"`
@@ -140,9 +141,10 @@ type confirmWire struct {
 }
 
 type errorWire struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Outcome string `json:"outcome"`
+	Retryable *bool  `json:"retryable,omitempty"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Outcome   string `json:"outcome"`
 }
 
 type registerProductInput struct {
@@ -191,7 +193,7 @@ func dishToWire(value contract.Dish) dishWire {
 }
 
 func proposalToWire(value contract.OrderProposal) proposalWire {
-	result := proposalWire{ProposalID: value.ProposalID, EvaluatedAt: formatTime(value.EvaluatedAt), StateVersion: strconv.FormatInt(value.StateVersion, 10), RequestedPositions: positionsToWire(value.RequestedPositions), AcceptedPositions: acceptedToWire(value.AcceptedPositions), Changes: make([]changeWire, len(value.Changes))}
+	result := proposalWire{WarehouseEpoch: value.WarehouseEpoch, ProposalID: value.ProposalID, EvaluatedAt: formatTime(value.EvaluatedAt), StateVersion: strconv.FormatInt(value.StateVersion, 10), RequestedPositions: positionsToWire(value.RequestedPositions), AcceptedPositions: acceptedToWire(value.AcceptedPositions), Changes: make([]changeWire, len(value.Changes))}
 	for index, change := range value.Changes {
 		result.Changes[index] = changeWire{LineNo: strconv.Itoa(change.LineNo), DishID: change.DishID, RequestedPortions: strconv.FormatInt(change.RequestedPortions, 10), AcceptedPortions: strconv.FormatInt(change.AcceptedPortions, 10), Deficits: deficitsToWire(change.Deficits)}
 	}

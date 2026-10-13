@@ -42,9 +42,11 @@ type Options struct {
 }
 
 type Handler struct {
-	runtime Runtime
-	options Options
-	mux     *http.ServeMux
+	scopedErrors   bool
+	scopedResponse *scopedResponse
+	runtime        Runtime
+	options        Options
+	mux            *http.ServeMux
 }
 
 func NewHandler(runtime Runtime, options Options) (*Handler, error) {
@@ -324,7 +326,7 @@ func (h *Handler) confirm(w http.ResponseWriter, r *http.Request, resolve bool) 
 		return
 	}
 	status := http.StatusOK
-	if value.Kind == contract.ConfirmationPending {
+	if value.Kind == contract.ConfirmationPending && !h.scopedErrors {
 		status = http.StatusAccepted
 	}
 	h.writeJSON(w, status, response)
@@ -423,6 +425,10 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 	status := http.StatusInternalServerError
 	var operation *contract.OperationError
 	if errors.As(err, &operation) {
+		if h.scopedErrors {
+			retryable := operation.Retryable
+			value.Retryable = &retryable
+		}
 		value.Code = operation.Code
 		if value.Code == "" {
 			value.Code = "InternalError"
@@ -475,18 +481,30 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 		}
 	}
 	switch value.Code {
-	case "InvalidArgument":
+	case "InvalidArgument", "InvalidRequest":
 		status = http.StatusBadRequest
-	case "ProductNotFound", "DishNotFound", "ProposalNotFound":
+	case "Unauthenticated", "InvalidToken":
+		status = http.StatusUnauthorized
+	case "Forbidden":
+		status = http.StatusForbidden
+	case "AuthUnavailable", "RuntimeNotReady", "ServiceUnavailable":
+		status = http.StatusServiceUnavailable
+	case "RuntimeReset", "CommandConflict", "SettingsChanged", "RefreshRequired", "ProductConflict", "DishConflict":
+		status = http.StatusConflict
+	case "ProductNotFound", "DishNotFound", "ProposalNotFound", "NotFound":
 		status = http.StatusNotFound
 	case "CommandIdentityConflict", "ProposalSuperseded", "ProductAlreadyExists", "DishAlreadyExists":
 		status = http.StatusConflict
-	case "InventoryUnavailable":
+	case "InventoryUnavailable", "CalculationUnavailable", "TimeZoneDataUnavailable":
 		status = http.StatusServiceUnavailable
 	case "UpstreamUnavailable":
 		status = http.StatusBadGateway
 	case "UpstreamTimeout":
 		status = http.StatusGatewayTimeout
+	case "ScopeDeleted":
+		status = http.StatusGone
+	case "RateLimited", "LimitExceeded":
+		status = http.StatusTooManyRequests
 	case "ConfirmationPending":
 		status = http.StatusAccepted
 	}
@@ -501,10 +519,40 @@ func outcomeForError(write bool) string {
 }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, value any) {
+	if h.scopedResponse != nil {
+		h.scopedResponse.preparationHeaders(w)
+	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		log.Printf("serving response encoding failed: %v", err)
 		return
+	}
+	if h.scopedErrors && status >= 400 {
+		var fields map[string]json.RawMessage
+		if err = json.Unmarshal(data, &fields); err != nil {
+			log.Printf("serving error encoding failed: %v", err)
+			return
+		}
+		if _, present := fields["retryable"]; !present {
+			fields["retryable"] = json.RawMessage("false")
+		}
+		data, err = json.Marshal(fields)
+		if err != nil {
+			log.Printf("serving error encoding failed: %v", err)
+			return
+		}
+	} else if h.scopedResponse != nil {
+		data, err = h.scopedResponse.envelope(data)
+		if err != nil {
+			response := h.scopedResponse
+			h.scopedResponse = nil
+			outcome := "unavailable"
+			if response.write {
+				outcome = "unknown"
+			}
+			h.writeError(w, &contract.OperationError{Code: "RuntimeNotReady", Message: "verified warehouse context is unavailable", Outcome: outcome}, response.write)
+			return
+		}
 	}
 	data = append(data, '\n')
 	w.Header().Set("Content-Type", "application/json")

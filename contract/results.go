@@ -1,6 +1,7 @@
 package contract
 
 type CommitResult struct {
+	Context         WarehouseContext
 	Kind            CommitResultKind
 	Order           *Order
 	OrderEvaluation *OrderEvaluation
@@ -36,6 +37,7 @@ type AttemptError struct {
 }
 
 type ConfirmationAttempt struct {
+	Context           WarehouseContext
 	CommandID         string
 	ProposalID        string
 	Fingerprint       string
@@ -124,6 +126,7 @@ func (result ConfirmResult) Clone() ConfirmResult {
 }
 
 type ConfirmResult struct {
+	Context      WarehouseContext
 	Kind         ConfirmResultKind
 	Order        *Order
 	Proposal     *OrderProposal
