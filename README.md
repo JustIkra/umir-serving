@@ -1,5 +1,7 @@
 # umir-serving
 
+Registration serializes factory creation through a cancellable gate. It does not hold the registry state mutex during external warehouse discovery. Auth can read runtime status during that discovery. Before publishing the runtime, registration rechecks the local tombstone and exact registration identity. A concurrent close prevents a late factory result from recreating its scope. Concurrent identical registrations still call the factory once.
+
 The executable serves the private restaurant-scoped backend v2 API. The legacy single-runtime constructors remain available for the selected assembly tests.
 
 Компоненты: OrdersService реализует подготовку и подтверждение предложений; MenuService предоставляет каталог, меню и стоп-лист; RecommendationsService ранжирует доступные блюда по фактическому распределению партий.

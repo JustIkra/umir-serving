@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Release the registry state mutex before warehouse discovery during registration. Preserve one factory call for concurrent identical registrations, support cancellation while waiting, and recheck closure before publishing a new runtime.
+
 - Fixed JWKS recovery at unchanged injected owner time with a separate general host retry clock. JWT and key-cache validity retain owner time; rollback and cancellation remain bounded.
 - Reject FIFO private config/credentials without a writer using nonblocking no-follow descriptor admission.
 - Reject malformed clock read/set/checkpoint responses before Go parsing, matching protocol offset ranges and nanosecond precision.

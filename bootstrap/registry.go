@@ -39,13 +39,14 @@ type Registry struct {
 	closed      map[string]restaurantRuntime
 	revision    string
 	ready       bool
+	registering chan struct{}
 }
 
 func NewRegistry(options RegistryOptions) (*Registry, error) {
 	if !contract.ValidEntityID(options.Epoch) || options.Now == nil || options.NewID == nil || options.WarehouseFactory == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &Registry{options: options, restaurants: make(map[string]restaurantRuntime), closed: make(map[string]restaurantRuntime)}, nil
+	return &Registry{options: options, restaurants: make(map[string]restaurantRuntime), closed: make(map[string]restaurantRuntime), registering: make(chan struct{}, 1)}, nil
 }
 
 func (r *Registry) Register(ctx context.Context, registration contract.RestaurantRegistration) error {
@@ -55,16 +56,17 @@ func (r *Registry) Register(ctx context.Context, registration contract.Restauran
 	if registration.ExpectedEpoch != r.options.Epoch {
 		return &contract.OperationError{Code: "RuntimeReset", Outcome: "indeterminate"}
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.closed[registration.TenantID]; ok {
-		return &contract.OperationError{Code: "ScopeDeleted", Outcome: "not_committed"}
+	select {
+	case r.registering <- struct{}{}:
+		defer func() { <-r.registering }()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if existing, ok := r.restaurants[registration.TenantID]; ok {
-		if existing.registration == registration {
-			return nil
-		}
-		return &contract.OperationError{Code: "CommandConflict", Outcome: "not_committed"}
+	r.mu.Lock()
+	exists, err := r.registrationStateLocked(registration)
+	r.mu.Unlock()
+	if exists || err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -88,9 +90,31 @@ func (r *Registry) Register(ctx context.Context, registration contract.Restauran
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	exists, err = r.registrationStateLocked(registration)
+	if exists || err != nil {
+		return err
+	}
 	runtime.registration = registration
 	r.restaurants[registration.TenantID] = restaurantRuntime{registration: registration, runtime: runtime, warehouseEpoch: ports.Epoch}
 	return nil
+}
+
+func (r *Registry) registrationStateLocked(registration contract.RestaurantRegistration) (bool, error) {
+	if _, ok := r.closed[registration.TenantID]; ok {
+		return false, &contract.OperationError{Code: "ScopeDeleted", Outcome: "not_committed"}
+	}
+	if existing, ok := r.restaurants[registration.TenantID]; ok {
+		if existing.registration == registration {
+			return true, nil
+		}
+		return false, &contract.OperationError{Code: "CommandConflict", Outcome: "not_committed"}
+	}
+	return false, nil
 }
 
 func (r *Registry) Resolve(ctx context.Context, scope contract.RequestScope) (*Runtime, contract.RuntimeInfo, error) {

@@ -17,6 +17,71 @@ const epochA = "44444444-4444-4444-8444-444444444444"
 const peerEpoch = "66666666-6666-4666-8666-666666666666"
 const operationA = "77777777-7777-4777-8777-777777777777"
 
+func TestRegistrationFactoryCanReadRuntimeStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	statusRead := make(chan struct{})
+	var registry *Registry
+	registry, err := NewRegistry(RegistryOptions{Epoch: epochA, Now: time.Now, NewID: func() string { return "p" }, WarehouseFactory: func(ctx context.Context, _ string) (WarehousePorts, error) {
+		go func() { registry.Status(); close(statusRead) }()
+		select {
+		case <-statusRead:
+			w := &warehouseStub{}
+			return WarehousePorts{Orders: w, Catalog: w, Menu: w, Epoch: peerEpoch}, nil
+		case <-ctx.Done():
+			return WarehousePorts{}, ctx.Err()
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = registry.Register(ctx, contract.RestaurantRegistration{OrgID: orgA, TenantID: tenantA, OperationID: operationA, ExpectedEpoch: epochA, LifecycleVersion: "1"})
+	<-statusRead
+	if err != nil {
+		t.Fatalf("factory callback blocked on registry status: %v", err)
+	}
+}
+
+func TestClosingScopeDuringFactoryCallPreventsLateRegistration(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	registry, err := NewRegistry(RegistryOptions{Epoch: epochA, Now: time.Now, NewID: func() string { return "p" }, WarehouseFactory: func(context.Context, string) (WarehousePorts, error) {
+		close(entered)
+		<-release
+		w := &warehouseStub{}
+		return WarehousePorts{Orders: w, Catalog: w, Menu: w, Epoch: peerEpoch}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := contract.RestaurantRegistration{OrgID: orgA, TenantID: tenantA, OperationID: operationA, ExpectedEpoch: epochA, LifecycleVersion: "1"}
+	registered := make(chan error, 1)
+	go func() { registered <- registry.Register(t.Context(), registration) }()
+	<-entered
+	closed := make(chan error, 1)
+	closeRequest := registration
+	closeRequest.OperationID, closeRequest.LifecycleVersion = tenantB, "2"
+	go func() { closed <- registry.Close(t.Context(), closeRequest) }()
+	select {
+	case err = <-closed:
+	case <-time.After(time.Second):
+		close(release)
+		<-registered
+		<-closed
+		t.Fatal("scope closure blocked behind external factory")
+	}
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = <-registered; err == nil {
+		t.Fatal("late registration recreated closed scope")
+	}
+	if _, _, err = registry.Resolve(t.Context(), contract.RequestScope{OrgID: orgA, TenantID: tenantA, LifecycleVersion: "1"}); err == nil {
+		t.Fatal("closed scope resolved")
+	}
+}
+
 func TestS1RegistryIsolatesIdenticalProposalAndCommandIDs(t *testing.T) {
 	at := time.Date(2026, 10, 13, 12, 0, 0, 0, time.FixedZone("MSK", 10800))
 	calls := 0
