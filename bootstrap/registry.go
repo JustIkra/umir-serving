@@ -63,6 +63,10 @@ func (r *Registry) Register(ctx context.Context, registration contract.Restauran
 		return ctx.Err()
 	}
 	r.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		r.mu.Unlock()
+		return err
+	}
 	exists, err := r.registrationStateLocked(registration)
 	r.mu.Unlock()
 	if exists || err != nil {
@@ -111,6 +115,18 @@ func (r *Registry) registrationStateLocked(registration contract.RestaurantRegis
 	if existing, ok := r.restaurants[registration.TenantID]; ok {
 		if existing.registration == registration {
 			return true, nil
+		}
+		identity := registration
+		identity.TimeZone, identity.SettingsVersion = existing.registration.TimeZone, existing.registration.SettingsVersion
+		if identity == existing.registration && contract.ValidVersion(registration.SettingsVersion) && contract.ValidVersion(existing.registration.SettingsVersion) {
+			current, currentErr := strconv.ParseInt(existing.registration.SettingsVersion, 10, 64)
+			next, nextErr := strconv.ParseInt(registration.SettingsVersion, 10, 64)
+			_, zoneErr := time.LoadLocation(registration.TimeZone)
+			if currentErr == nil && nextErr == nil && next > current && zoneErr == nil && registration.TimeZone != "" && registration.TimeZone != "Local" {
+				existing.registration = registration
+				r.restaurants[registration.TenantID] = existing
+				return true, nil
+			}
 		}
 		return false, &contract.OperationError{Code: "CommandConflict", Outcome: "not_committed"}
 	}

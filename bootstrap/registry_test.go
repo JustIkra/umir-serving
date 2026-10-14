@@ -17,6 +17,54 @@ const epochA = "44444444-4444-4444-8444-444444444444"
 const peerEpoch = "66666666-6666-4666-8666-666666666666"
 const operationA = "77777777-7777-4777-8777-777777777777"
 
+func TestRegistrationSettingsRefreshPreservesRuntime(t *testing.T) {
+	calls := 0
+	registry, err := NewRegistry(RegistryOptions{Epoch: epochA, Now: time.Now, NewID: func() string { return "p" }, WarehouseFactory: func(context.Context, string) (WarehousePorts, error) {
+		calls++
+		w := &warehouseStub{}
+		return WarehousePorts{Orders: w, Catalog: w, Menu: w, Epoch: peerEpoch}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := contract.RestaurantRegistration{OrgID: orgA, TenantID: tenantA, OperationID: operationA, ExpectedEpoch: epochA, LifecycleVersion: "1", TimeZone: "Europe/Moscow", SettingsVersion: "1"}
+	if err := registry.Register(t.Context(), registration); err != nil {
+		t.Fatal(err)
+	}
+	scope := contract.RequestScope{OrgID: orgA, TenantID: tenantA, LifecycleVersion: "1"}
+	before, _, err := registry.Resolve(t.Context(), scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresh := registration
+	refresh.TimeZone, refresh.SettingsVersion = "Europe/Berlin", "2"
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := registry.Register(canceled, refresh); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled refresh result: %v", err)
+	}
+	if err := registry.Register(t.Context(), registration); err != nil {
+		t.Fatal("canceled refresh changed registration")
+	}
+	if err := registry.Register(t.Context(), refresh); err != nil {
+		t.Fatalf("current Auth settings rejected: %v", err)
+	}
+	after, _, err := registry.Resolve(t.Context(), scope)
+	if err != nil || before != after || calls != 1 {
+		t.Fatalf("refresh replaced runtime or repeated discovery: calls=%d err=%v", calls, err)
+	}
+	for _, invalid := range []contract.RestaurantRegistration{registration, func() contract.RestaurantRegistration { v := refresh; v.TimeZone = "Europe/Moscow"; return v }(), func() contract.RestaurantRegistration {
+		v := refresh
+		v.OperationID = tenantB
+		v.SettingsVersion = "3"
+		return v
+	}()} {
+		if registry.Register(t.Context(), invalid) == nil {
+			t.Fatal("settings refresh admitted rollback or identity conflict")
+		}
+	}
+}
+
 func TestRegistrationFactoryCanReadRuntimeStatus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()

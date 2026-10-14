@@ -2,6 +2,11 @@
 
 ## Не выпущено
 
+- Accept monotonically newer Auth settings on an unchanged runtime registration.
+  Preserve the current runtime and its retained proposal/attempt state without
+  another warehouse factory call. Reject settings rollback, zone changes at the
+  same version, changed stable identity, cancellation and closed scopes.
+
 - Release the registry state mutex before warehouse discovery during registration. Preserve one factory call for concurrent identical registrations, support cancellation while waiting, and recheck closure before publishing a new runtime.
 
 - Fixed JWKS recovery at unchanged injected owner time with a separate general host retry clock. JWT and key-cache validity retain owner time; rollback and cancellation remain bounded.

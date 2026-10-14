@@ -2,6 +2,13 @@
 
 Registration serializes factory creation through a cancellable gate. It does not hold the registry state mutex during external warehouse discovery. Auth can read runtime status during that discovery. Before publishing the runtime, registration rechecks the local tombstone and exact registration identity. A concurrent close prevents a late factory result from recreating its scope. Concurrent identical registrations still call the factory once.
 
+An Auth registration with the same organization, restaurant, operation, epoch and
+lifecycle version can refresh monotonically newer settings. A valid zone and
+newer positive settingsVersion update only registry metadata. The existing runtime,
+proposals and attempts remain in place, and warehouse discovery is not repeated.
+An older settings version, a different zone at the same version, cancellation,
+changed identity or a closed scope cannot apply that refresh.
+
 The executable serves the private restaurant-scoped backend v2 API. The legacy single-runtime constructors remain available for the selected assembly tests.
 
 Компоненты: OrdersService реализует подготовку и подтверждение предложений; MenuService предоставляет каталог, меню и стоп-лист; RecommendationsService ранжирует доступные блюда по фактическому распределению партий.
@@ -28,7 +35,7 @@ Serving обращается к warehouse по внутреннему HTTP API. 
 
 `bootstrap.NewHTTP` retains the legacy routes and Warehouse transport as an explicit library composition. The executable uses `bootstrap.NewProcessHTTP`; it never attaches the unscoped handler to the backend v2 topology.
 
-For the new topology, compose `bootstrap.NewRegistry` with an injected UUIDv4 Serving epoch, clock, ID generator and `WarehouseClientFactory`. Register each restaurant explicitly with its org, operation ID, expected epoch and lifecycle version. Registration builds one proposal/attempt store and separate Orders, Menu and Recommendations services. An identical registration keeps the runtime. A changed registration conflicts. Reads and writes never create a restaurant. Command and proposal identities are local to one restaurant runtime. A retained runtime requires its matching request scope and capability on every method.
+For the new topology, compose `bootstrap.NewRegistry` with an injected UUIDv4 Serving epoch, clock, ID generator and `WarehouseClientFactory`. Register each restaurant explicitly with its org, operation ID, expected epoch and lifecycle version. Registration builds one proposal/attempt store and separate Orders, Menu and Recommendations services. An identical registration keeps the runtime. A registration with a changed stable identity conflicts; only the settings refresh described above is allowed. Reads and writes never create a restaurant. Command and proposal identities are local to one restaurant runtime. A retained runtime requires its matching request scope and capability on every method.
 
 Compose `bootstrap.NewJWTVerifier` with an injected clock and read-only signing-key source, then `bootstrap.NewScopedHTTP` with the registry, verifier, Gateway transport key, request budget and body limit (at most 1 MiB). Keep this handler on an unpublished private listener. Off the isolated test network, use TLS and validate certificates and hostnames. The key source resolves only trusted Auth Ed25519 public keys by kid; it must report key discovery failures and unknown keys. Serving has no signing key. `NewProcessHTTP` supplies bounded, authenticated Auth JWKS discovery.
 
