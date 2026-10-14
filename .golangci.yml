@@ -32,14 +32,24 @@ linters:
           list-mode: lax
           files: ["$all", "!$test"]
           deny:
-            - pkg: "github.com/JustIkra/umir-serving/tests/"
-              desc: "Production must not import test support."
             - pkg: "github.com/JustIkra/umir-warehouse"
               desc: "Service modules interact through their declared boundary."
             - pkg: "github.com/JustIkra/umir-gateway"
               desc: "Service modules interact through their declared boundary."
             - pkg: "github.com/JustIkra/umir-factory"
               desc: "Service code must not import the factory."
+        fixture-imports:
+          list-mode: lax
+          files: ["$all", "!$test", "!**/tests/fixtures/server/main.go", "!**/tests/fixtures/control/main.go", "!**/tests/fixtures/catalog/build/main.go"]
+          deny:
+            - pkg: "github.com/JustIkra/umir-serving/tests/"
+              desc: "Production must not import test support."
+        fixture-catalog-consumers:
+          list-mode: strict
+          files: ["**/tests/fixtures/server/main.go", "**/tests/fixtures/control/main.go", "**/tests/fixtures/catalog/build/main.go"]
+          allow:
+            - "$gostd"
+            - "github.com/JustIkra/umir-serving/tests/fixtures/catalog$"
         domain:
           list-mode: strict
           files:

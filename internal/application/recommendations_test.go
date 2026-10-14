@@ -78,3 +78,37 @@ func TestRecommendationDishTie(t *testing.T) {
 		t.Fatalf("GetRecommendations() dish order = %+v", result.Items)
 	}
 }
+
+func TestS2RecommendationsRejectExpiredAllocation(t *testing.T) {
+	at := time.Date(2026, 10, 13, 12, 0, 0, 0, time.FixedZone("MSK", 3*3600))
+	for _, expiry := range []time.Time{at, at.Add(-time.Nanosecond)} {
+		service := application.NewRecommendationsService(&menuPortFake{evaluation: contract.MenuEvaluation{EvaluatedAt: at, Dishes: []contract.DishEvaluation{{DishID: "dish", DishName: "Dish", IsAvailable: true, Allocations: []contract.MenuAllocation{{ProductID: "p", BatchID: "pending", Quantity: 1, BaseUnit: "g", ExpiresAt: expiry}}}}}})
+		if _, err := service.GetRecommendations(context.Background()); err == nil {
+			t.Fatal("expired/pending allocation became a recommendation")
+		}
+	}
+}
+
+func TestS2RecommendationsUnsortedMinimumAndExactTies(t *testing.T) {
+	at := time.Date(2026, 10, 13, 12, 0, 0, 0, time.FixedZone("MSK", 3*3600))
+	early := at.Add(time.Hour)
+	late := at.Add(2 * time.Hour)
+	warehouse := &menuPortFake{evaluation: contract.MenuEvaluation{EvaluatedAt: at, StateVersion: 8, Dishes: []contract.DishEvaluation{
+		{DishID: "later", DishName: "Later", IsAvailable: true, Allocations: []contract.MenuAllocation{{ProductID: "p", BatchID: "later", Quantity: 1, BaseUnit: "g", ExpiresAt: late}}},
+		{DishID: "earlier", DishName: "Earlier", IsAvailable: true, Allocations: []contract.MenuAllocation{{ProductID: "p", BatchID: "late", Quantity: 1, BaseUnit: "g", ExpiresAt: late}, {ProductID: "z", BatchID: "early-z", Quantity: 9007199254740993, BaseUnit: "ml", ExpiresAt: early}, {ProductID: "a", BatchID: "early-a", Quantity: 17, BaseUnit: "pcs", ExpiresAt: early}}},
+		{DishID: "pending", IsAvailable: false},
+	}}}
+	service := application.NewRecommendationsService(warehouse)
+	for range 2 {
+		value, err := service.GetRecommendations(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(value.Items) != 2 || value.Items[0].DishID != "earlier" || !value.Items[0].PriorityExpiresAt.Equal(early) || len(value.Items[0].Reasons) != 2 || value.Items[0].Reasons[0].ProductID != "a" || value.Items[0].Reasons[1].QuantityPerPortion != 9007199254740993 || value.Items[0].Reasons[1].BaseUnit != "ml" {
+			t.Fatalf("FEFO reasons changed: %+v", value)
+		}
+	}
+	if warehouse.calls != 2 || warehouse.evaluation.StateVersion != 8 || warehouse.evaluation.Dishes[1].Allocations[1].Quantity != 9007199254740993 {
+		t.Fatal("recommendation query changed the captured stock")
+	}
+}

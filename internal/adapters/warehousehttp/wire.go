@@ -232,8 +232,8 @@ func dishFromWire(value wireDish) (contract.Dish, error) {
 	return dish, nil
 }
 
-func evaluationFromWire(value wireOrderEvaluation) (contract.OrderEvaluation, error) {
-	evaluatedAt, err := parseMoscowTime(value.EvaluatedAt)
+func evaluationFromWire(value wireOrderEvaluation, parseTime func(string) (time.Time, error)) (contract.OrderEvaluation, error) {
+	evaluatedAt, err := parseTime(value.EvaluatedAt)
 	if err != nil {
 		return contract.OrderEvaluation{}, err
 	}
@@ -299,4 +299,19 @@ func deficitsFromWire(values []wireDeficit) ([]contract.Deficit, error) {
 		result[index] = contract.Deficit{ProductID: value.ProductID, RequiredQuantity: required, AvailableQuantity: available}
 	}
 	return result, nil
+}
+
+var instantPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$`)
+
+func parseInstant(value string) (time.Time, error) {
+	if !instantPattern.MatchString(value) {
+		return time.Time{}, fmt.Errorf("invalid explicit instant")
+	}
+	return time.Parse(time.RFC3339Nano, value)
+}
+func (c *Client) parseTimestamp(value string) (time.Time, error) {
+	if c.scoped != nil {
+		return parseInstant(value)
+	}
+	return parseMoscowTime(value)
 }

@@ -105,12 +105,16 @@ func TestClientCommitTimeoutRemainsUnknownWithoutRetry(t *testing.T) {
 	}))
 	defer server.Close()
 	defer close(release)
-	client, err := NewClient(server.URL, server.Client(), 20*time.Millisecond)
+	client, err := NewClient(server.URL, server.Client(), time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = client.CommitAcceptedOrder(context.Background(), structCommitRequest())
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout probe did not reach the owner")
+	}
 	var operation *contract.OperationError
 	if !errors.As(err, &operation) || operation.Code != "UpstreamTimeout" || operation.Outcome != "unknown" {
 		t.Fatalf("commit timeout error = %#v, want UpstreamTimeout/unknown", err)

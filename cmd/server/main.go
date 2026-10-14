@@ -31,7 +31,7 @@ func handler() (*bootstrap.HTTPHandler, error) {
 	if err != nil {
 		return nil, err
 	}
-	warehouseTimeout, err := durationSetting("WAREHOUSE_TIMEOUT", "10s")
+	warehouseTimeout, err := durationSetting("WAREHOUSE_TIMEOUT", "5s")
 	if err != nil {
 		return nil, err
 	}
@@ -43,13 +43,32 @@ func handler() (*bootstrap.HTTPHandler, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, publicHandler, err := bootstrap.NewHTTP(bootstrap.HTTPOptions{
-		WarehouseInternalURL: env("WAREHOUSE_INTERNAL_URL", "http://warehouse:8082"),
-		WarehouseTimeout:     warehouseTimeout,
-		RequestTimeout:       requestTimeout,
-		MaxRequestBytes:      maxRequestBytes,
-		Now:                  func() time.Time { return time.Now().In(location) },
-		NewID:                newID,
+	authTimeout, err := durationSetting("AUTH_TIMEOUT", "5s")
+	if err != nil {
+		return nil, err
+	}
+	pollInterval, err := durationSetting("REGISTRY_POLL_INTERVAL", "30s")
+	if err != nil {
+		return nil, err
+	}
+	publicHandler, err := bootstrap.NewProcessHTTP(bootstrap.ProcessHTTPOptions{
+		HTTPOptions: bootstrap.HTTPOptions{
+			WarehouseInternalURL: env("WAREHOUSE_INTERNAL_URL", "http://warehouse:8082"),
+			WarehouseTimeout:     warehouseTimeout,
+			RequestTimeout:       requestTimeout,
+			MaxRequestBytes:      maxRequestBytes,
+			Now:                  func() time.Time { return time.Now().In(location) },
+			NewID:                newID,
+		},
+		AuthInternalURL:      os.Getenv("AUTH_INTERNAL_URL"),
+		AuthTimeout:          authTimeout,
+		ServingAuthKey:       os.Getenv("SERVING_AUTH_KEY"),
+		AuthRuntimeKey:       os.Getenv("AUTH_RUNTIME_KEY"),
+		GatewayServingKey:    os.Getenv("GATEWAY_SERVING_KEY"),
+		ServingWarehouseKey:  os.Getenv("SERVING_WAREHOUSE_KEY"),
+		TZDataVersion:        os.Getenv("TZDATA_VERSION"),
+		Epoch:                newEpoch(),
+		RegistryPollInterval: pollInterval,
 	})
 	if err != nil {
 		return nil, err
@@ -90,6 +109,16 @@ func newID() string {
 		return ""
 	}
 	return hex.EncodeToString(value[:])
+}
+
+func newEpoch() string {
+	var value [16]byte
+	if _, err := cryptorand.Read(value[:]); err != nil {
+		return ""
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[:4], value[4:6], value[6:8], value[8:10], value[10:])
 }
 
 func healthcheck() (result error) {

@@ -28,7 +28,18 @@ type Change struct {
 	Deficits          []Deficit
 }
 
+type ProposalContext struct {
+	OrgID           string
+	TenantID        string
+	Epoch           string
+	TimeZone        string
+	SettingsVersion string
+	EvaluatedAt     time.Time
+	StateVersion    int64
+}
+
 type OrderProposal struct {
+	Context            ProposalContext
 	ProposalID         string
 	EvaluatedAt        time.Time
 	StateVersion       int64

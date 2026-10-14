@@ -3,10 +3,12 @@ package contract
 import "errors"
 
 type OperationError struct {
-	Code    string
-	Message string
-	Outcome string
-	Cause   error
+	Retryable   bool
+	Preparation *WarehousePreparation
+	Code        string
+	Message     string
+	Outcome     string
+	Cause       error
 }
 
 func (e *OperationError) Error() string {

@@ -2,9 +2,15 @@ name: umir-serving
 services:
   app:
     build: .
-    ports:
-      - "127.0.0.1:18082:8080"
+    expose:
+      - "8080"
     environment:
       TZ: Europe/Moscow
+      AUTH_INTERNAL_URL: ${AUTH_INTERNAL_URL:?required private Auth URL}
+      WAREHOUSE_INTERNAL_URL: ${WAREHOUSE_INTERNAL_URL:-http://warehouse:8082}
+      SERVING_AUTH_KEY: ${SERVING_AUTH_KEY:?required Serving to Auth key}
+      AUTH_RUNTIME_KEY: ${AUTH_RUNTIME_KEY:?required Auth to Serving key}
+      GATEWAY_SERVING_KEY: ${GATEWAY_SERVING_KEY:?required Gateway to Serving key}
+      SERVING_WAREHOUSE_KEY: ${SERVING_WAREHOUSE_KEY:?required Serving to Warehouse key}
+      TZDATA_VERSION: ${TZDATA_VERSION:?required packaged timezone data version}
     restart: unless-stopped
-
