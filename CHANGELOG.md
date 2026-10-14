@@ -2,6 +2,9 @@
 
 ## Не выпущено
 
+- Bound the test-only commit timeout probe's owner-entry wait and allow one second
+  for actual HTTP dispatch. Keep the unknown outcome and single-attempt assertions.
+
 - Accept monotonically newer Auth settings on an unchanged runtime registration.
   Preserve the current runtime and its retained proposal/attempt state without
   another warehouse factory call. Reject settings rollback, zone changes at the
