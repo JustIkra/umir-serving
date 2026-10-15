@@ -19,7 +19,10 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 	if request.CommandID == "" || request.ProposalID == "" {
 		return contract.ConfirmResult{}, contract.ErrInvalidArgument
 	}
-	unlock := s.lockProposal(request.ProposalID)
+	unlock, err := s.lockProposal(ctx, request.ProposalID)
+	if err != nil {
+		return contract.ConfirmResult{}, err
+	}
 	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return contract.ConfirmResult{}, err
@@ -341,7 +344,10 @@ func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contrac
 	if s.attempts == nil || s.attemptReader == nil {
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	}
-	unlock := s.lockProposal(request.ProposalID)
+	unlock, err := s.lockProposal(ctx, request.ProposalID)
+	if err != nil {
+		return contract.ConfirmResult{}, err
+	}
 	defer unlock()
 	fingerprint, err := confirmOrderFingerprint(request.ProposalID)
 	if err != nil {

@@ -26,7 +26,7 @@ type OrdersService struct {
 }
 
 type proposalLock struct {
-	mu   sync.Mutex
+	sem  chan struct{}
 	refs int
 }
 
@@ -98,18 +98,19 @@ func definiteCommitRejection(err error) bool {
 		errors.Is(err, contract.ErrCommandIdentityConflict)
 }
 
-func (s *OrdersService) lockProposal(proposalID string) func() {
+// lockProposal serializes work on one proposal. The wait ends with the context
+// error when ctx is done first, before the caller touches any store or
+// Warehouse; the error is returned as is and proves nothing about a commit.
+func (s *OrdersService) lockProposal(ctx context.Context, proposalID string) (func(), error) {
 	s.locksMu.Lock()
 	lock := s.locks[proposalID]
 	if lock == nil {
-		lock = &proposalLock{}
+		lock = &proposalLock{sem: make(chan struct{}, 1)}
 		s.locks[proposalID] = lock
 	}
 	lock.refs++
 	s.locksMu.Unlock()
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
+	release := func() {
 		s.locksMu.Lock()
 		lock.refs--
 		if lock.refs == 0 {
@@ -117,6 +118,16 @@ func (s *OrdersService) lockProposal(proposalID string) func() {
 		}
 		s.locksMu.Unlock()
 	}
+	select {
+	case lock.sem <- struct{}{}:
+	case <-ctx.Done():
+		release()
+		return nil, ctx.Err()
+	}
+	return func() {
+		<-lock.sem
+		release()
+	}, nil
 }
 
 func confirmOrderFingerprint(proposalID string) (string, error) {
