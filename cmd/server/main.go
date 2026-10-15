@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	_ "time/tzdata"
@@ -28,6 +29,39 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// secretFileMaxBytes bounds a service key file.
+const secretFileMaxBytes = 64 << 10
+
+// secretEnv returns the secret NAME from the environment, or from the file
+// named by NAME_FILE. Setting both is an error. Only the trailing line break of
+// a file is removed. Errors name the variable and never carry the value.
+func secretEnv(getenv func(string) string, name string) (string, error) {
+	value, path := getenv(name), getenv(name+"_FILE")
+	if path == "" {
+		return value, nil
+	}
+	if value != "" {
+		return "", fmt.Errorf("%s and %s_FILE are both set", name, name)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("%s_FILE: cannot read: %w", name, err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, secretFileMaxBytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return "", fmt.Errorf("%s_FILE: cannot read: %w", name, errors.Join(readErr, closeErr))
+	}
+	if len(data) > secretFileMaxBytes {
+		return "", fmt.Errorf("%s_FILE: file is too large", name)
+	}
+	secret := strings.TrimRight(string(data), "\r\n")
+	if secret == "" {
+		return "", fmt.Errorf("%s_FILE: file is empty", name)
+	}
+	return secret, nil
 }
 
 // handler assembles the process handler with logging discarded.
@@ -60,6 +94,12 @@ func handlerWithLogger(logger *slog.Logger) (*bootstrap.HTTPHandler, error) {
 	if err != nil {
 		return nil, err
 	}
+	var keys [4]string
+	for i, name := range []string{"SERVING_AUTH_KEY", "AUTH_RUNTIME_KEY", "GATEWAY_SERVING_KEY", "SERVING_WAREHOUSE_KEY"} {
+		if keys[i], err = secretEnv(os.Getenv, name); err != nil {
+			return nil, err
+		}
+	}
 	publicHandler, err := bootstrap.NewProcessHTTP(bootstrap.ProcessHTTPOptions{
 		HTTPOptions: bootstrap.HTTPOptions{
 			WarehouseInternalURL: env("WAREHOUSE_INTERNAL_URL", "http://warehouse:8082"),
@@ -72,10 +112,10 @@ func handlerWithLogger(logger *slog.Logger) (*bootstrap.HTTPHandler, error) {
 		},
 		AuthInternalURL:      os.Getenv("AUTH_INTERNAL_URL"),
 		AuthTimeout:          authTimeout,
-		ServingAuthKey:       os.Getenv("SERVING_AUTH_KEY"),
-		AuthRuntimeKey:       os.Getenv("AUTH_RUNTIME_KEY"),
-		GatewayServingKey:    os.Getenv("GATEWAY_SERVING_KEY"),
-		ServingWarehouseKey:  os.Getenv("SERVING_WAREHOUSE_KEY"),
+		ServingAuthKey:       keys[0],
+		AuthRuntimeKey:       keys[1],
+		GatewayServingKey:    keys[2],
+		ServingWarehouseKey:  keys[3],
 		TZDataVersion:        os.Getenv("TZDATA_VERSION"),
 		Epoch:                newUUID(),
 		RegistryPollInterval: pollInterval,

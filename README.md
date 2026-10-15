@@ -202,10 +202,10 @@ The local Compose file builds only Serving. It exposes port 8080 to its private 
 | `PORT` | `8080` on the private listener |
 | `AUTH_INTERNAL_URL` | Required private Auth origin |
 | `WAREHOUSE_INTERNAL_URL` | `http://warehouse:8082` |
-| `SERVING_AUTH_KEY` | Required Serving → Auth transport key |
-| `AUTH_RUNTIME_KEY` | Required Auth → Serving transport key |
-| `GATEWAY_SERVING_KEY` | Required Gateway → Serving transport key |
-| `SERVING_WAREHOUSE_KEY` | Required Serving → Warehouse transport key |
+| `SERVING_AUTH_KEY` or `SERVING_AUTH_KEY_FILE` | Required Serving → Auth transport key |
+| `AUTH_RUNTIME_KEY` or `AUTH_RUNTIME_KEY_FILE` | Required Auth → Serving transport key |
+| `GATEWAY_SERVING_KEY` or `GATEWAY_SERVING_KEY_FILE` | Required Gateway → Serving transport key |
+| `SERVING_WAREHOUSE_KEY` or `SERVING_WAREHOUSE_KEY_FILE` | Required Serving → Warehouse transport key |
 | `TZDATA_VERSION` | Required packaged version, matching all peer containers |
 | `AUTH_TIMEOUT` | `5s`; positive, at most five seconds |
 | `WAREHOUSE_TIMEOUT` | `5s`; positive, at most five seconds |
@@ -214,7 +214,7 @@ The local Compose file builds only Serving. It exposes port 8080 to its private 
 | `MAX_REQUEST_BYTES` | `1048576`; positive, at most 1 MiB |
 | `SERVING_INSTANCE_ID` | Optional replica name (letters, digits, `.`, `_`, `-`, up to 64 characters); a random UUID of the process if unset. Written as `instance_id` in logs |
 
-Do not reuse one key across caller pairs. URLs must be private trusted endpoints; Auth takes an origin without a path. Use certificate/hostname-validated TLS outside the isolated test network. No secret value belongs in source or logs. Programmatic `ProcessHTTPOptions` exposes the same configuration plus injected epoch, clock, ID source and optional HTTP client.
+Each of the four transport keys is given either directly (`SERVING_AUTH_KEY`, legacy profile) or as the path of a file (`SERVING_AUTH_KEY_FILE`, secret-file profile); the same applies to the other three. The file holds the key; one trailing line break (`\n` or `\r\n`) is removed, spaces are kept, and the file may be up to 64 KiB. Setting both forms of one key, an empty or unreadable file, or a file over the limit stops the start; the error names the variable and never contains the value. Do not reuse one key across caller pairs. URLs must be private trusted endpoints; Auth takes an origin without a path. Use certificate/hostname-validated TLS outside the isolated test network. No secret value belongs in source or logs. Programmatic `ProcessHTTPOptions` exposes the same configuration plus injected epoch, clock, ID source and optional HTTP client.
 
 Общая сборка и команды запуска описаны в [README фабрики](https://github.com/JustIkra/umir-factory#readme).
 
