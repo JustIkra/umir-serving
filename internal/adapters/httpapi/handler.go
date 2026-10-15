@@ -434,7 +434,7 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 	if deadlineErr := controller.SetWriteDeadline(time.Now().Add(errorFlushBudget)); deadlineErr != nil && !errors.Is(deadlineErr, http.ErrNotSupported) {
 		log.Printf("serving set error write deadline: %v", deadlineErr)
 	}
-	value := errorWire{Code: "InternalError", Message: "service request failed", Outcome: "unavailable"}
+	value := errorWire{Code: "TechnicalError", Message: "service request failed", Outcome: "unavailable"}
 	status := http.StatusInternalServerError
 	var operation *contract.OperationError
 	if errors.As(err, &operation) {
@@ -444,7 +444,13 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 		}
 		value.Code = operation.Code
 		if value.Code == "" {
-			value.Code = "InternalError"
+			value.Code = "TechnicalError"
+		}
+		if value.Code == "CommandIdentityConflict" { // a legacy Warehouse code; the public enum has CommandConflict
+			value.Code = "CommandConflict"
+		}
+		if value.Code == "InternalError" { // a legacy Warehouse code; the public enum has TechnicalError
+			value.Code = "TechnicalError"
 		}
 		value.Outcome = operation.Outcome
 		if operation.Message != "" {
@@ -462,7 +468,7 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 			value.Message = "request contains invalid fields"
 			value.Outcome = invalidArgumentOutcome
 		case errors.Is(err, contract.ErrCommandIdentityConflict):
-			value.Code = "CommandIdentityConflict"
+			value.Code = "CommandConflict"
 			value.Message = "command identity conflicts with an existing attempt"
 			value.Outcome = "not_committed"
 		case errors.Is(err, contract.ErrProposalNotFound):
@@ -506,7 +512,7 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 		status = http.StatusConflict
 	case "ProductNotFound", "DishNotFound", "ProposalNotFound", "NotFound":
 		status = http.StatusNotFound
-	case "CommandIdentityConflict", "ProposalSuperseded", "ProductAlreadyExists", "DishAlreadyExists":
+	case "ProposalSuperseded", "ProductAlreadyExists", "DishAlreadyExists":
 		status = http.StatusConflict
 	case "InventoryUnavailable", "CalculationUnavailable", "TimeZoneDataUnavailable":
 		status = http.StatusServiceUnavailable

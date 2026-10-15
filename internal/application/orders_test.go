@@ -512,7 +512,7 @@ func TestForeignWarehouseIdentityRejectsExistingPendingAttemptAndReleasesProposa
 		t.Fatalf("first ConfirmOrder() error = %v, want terminal command identity conflict", firstErr)
 	}
 	attempt, found, attemptErr := store.GetAttempt(context.Background(), "command-1")
-	if attemptErr != nil || !found || attempt.State != contract.OrderAttemptRejected || attempt.Error == nil || attempt.Error.Code != "CommandIdentityConflict" || attempt.Error.Outcome != "not_committed" {
+	if attemptErr != nil || !found || attempt.State != contract.OrderAttemptRejected || attempt.Error == nil || attempt.Error.Code != "CommandConflict" || attempt.Error.Outcome != "not_committed" {
 		t.Fatalf("attempt = (%+v,%v,%v), want cached rejection", attempt, found, attemptErr)
 	}
 	proposal, proposalFound, proposalErr := store.Get(context.Background(), "proposal-1")
@@ -534,6 +534,49 @@ func TestForeignWarehouseIdentityRejectsExistingPendingAttemptAndReleasesProposa
 	_, commits := warehouse.commits()
 	if commits != 1 {
 		t.Fatalf("warehouse commits = %d, want only C2", commits)
+	}
+}
+
+// Attempts stored before CommandConflict was adopted carry the old code. It is
+// only read: the caller gets the public code, and the cause stays the identity
+// conflict.
+func TestStoredAttemptWithLegacyCommandIdentityConflictCodeIsServedAsCommandConflict(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 1))
+	if _, _, err := store.BeginAttempt(context.Background(), contract.ConfirmationAttempt{CommandID: "command-1", ProposalID: "proposal-1", Fingerprint: confirmFingerprint("proposal-1")}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := &contract.AttemptError{Code: "CommandIdentityConflict", Message: "command identity conflicts with an existing attempt", Outcome: "not_committed"}
+	if err := store.CompleteAttempt(context.Background(), "command-1", contract.ConfirmResult{}, legacy, nil); err != nil {
+		t.Fatal(err)
+	}
+	service := newOrdersService(t, store, warehouse)
+	_, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	var operation *contract.OperationError
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) || !errors.As(err, &operation) || operation.Code != "CommandConflict" || operation.Outcome != "not_committed" {
+		t.Fatalf("ConfirmOrder() error = %#v, want CommandConflict/not_committed with identity conflict cause", err)
+	}
+	stored, found, err := store.GetAttempt(context.Background(), "command-1")
+	if err != nil || !found || stored.Error == nil || stored.Error.Code != "CommandIdentityConflict" {
+		t.Fatalf("stored attempt was rewritten: (%+v,%v,%v)", stored, found, err)
+	}
+}
+
+func TestRejectedAttemptFromLegacyWarehouseConflictIsStoredAsCommandConflict(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 1))
+	warehouse.commitErr = &contract.OperationError{Code: "CommandIdentityConflict", Message: "conflict", Outcome: "not_committed", Cause: contract.ErrCommandIdentityConflict}
+	service := newOrdersService(t, store, warehouse)
+	_, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	var operation *contract.OperationError
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) || !errors.As(err, &operation) || operation.Code != "CommandConflict" {
+		t.Fatalf("ConfirmOrder() error = %#v, want CommandConflict", err)
+	}
+	stored, found, getErr := store.GetAttempt(context.Background(), "command-1")
+	if getErr != nil || !found || stored.State != contract.OrderAttemptRejected || stored.Error == nil || stored.Error.Code != "CommandConflict" {
+		t.Fatalf("stored attempt = (%+v,%v,%v), want Rejected/CommandConflict", stored, found, getErr)
 	}
 }
 

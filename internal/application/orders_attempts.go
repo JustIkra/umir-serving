@@ -435,17 +435,25 @@ func terminalAttempt(attempt contract.ConfirmationAttempt) (contract.ConfirmResu
 	return contract.ConfirmResult{}, nil, false
 }
 
+// legacyCommandIdentityConflictCode was written to stored attempts before the
+// public v2 code CommandConflict was adopted. It is only read, never written.
+const legacyCommandIdentityConflictCode = "CommandIdentityConflict"
+
 func attemptErrorFrom(err error) contract.AttemptError {
 	var remote *contract.OperationError
 	if errors.As(err, &remote) && remote.Outcome == "not_committed" {
-		return contract.AttemptError{Code: remote.Code, Message: remote.Message, Outcome: remote.Outcome}
+		code := remote.Code
+		if code == legacyCommandIdentityConflictCode {
+			code = "CommandConflict"
+		}
+		return contract.AttemptError{Code: code, Message: remote.Message, Outcome: remote.Outcome}
 	}
 	code := "InventoryUnavailable"
 	switch {
 	case errors.Is(err, contract.ErrInvalidArgument):
 		code = "InvalidArgument"
 	case errors.Is(err, contract.ErrCommandIdentityConflict):
-		code = "CommandIdentityConflict"
+		code = "CommandConflict"
 	case errors.Is(err, contract.ErrProductNotFound):
 		code = "ProductNotFound"
 	case errors.Is(err, contract.ErrDishNotFound):
@@ -463,8 +471,9 @@ func errorFromAttempt(value contract.AttemptError) error {
 		cause = contract.ErrInvalidArgument
 	case "InventoryUnavailable":
 		cause = contract.ErrInventoryUnavailable
-	case "CommandIdentityConflict":
+	case "CommandConflict", legacyCommandIdentityConflictCode: // the old code may exist in stored attempts
 		cause = contract.ErrCommandIdentityConflict
+		value.Code = "CommandConflict"
 	case "ProductNotFound":
 		cause = contract.ErrProductNotFound
 	case "DishNotFound":

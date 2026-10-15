@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Fix: Serving now reports only codes from the public v2 `Error.code` enum for its own errors. A command identity conflict (same command ID with another proposal or accepted positions) is `CommandConflict` instead of `CommandIdentityConflict`, and an unclassified failure or an `OperationError` without a code is `TechnicalError` (HTTP 500) instead of `InternalError`; the Gateway turned the old codes into 502/`unknown`. The HTTP status (409) and `outcome=not_committed` are unchanged. Stored rejected attempts that still carry `CommandIdentityConflict` are read and served as `CommandConflict`, and the old code is no longer written. A Warehouse response about an ambiguous write is not renamed. Clients that matched the old codes must match the new ones.
+
 - Refuse legacy optional envelope fields on the closed FIN1 recommendation-input context before recording its observation. Preserve existing compatibility decoding for unrelated requests.
 
 - Add the scoped FIN1 recommendation policy and strict coherent Warehouse input port. Rank with exact urgency, risky portion share and consumption factors, using explicit history/fallback demand and finite explanatory values. Keep selected legacy v1 behavior and its tests separate. FIN1 consumers must adopt the composed response profile and narrow recommendation permission together.
