@@ -140,7 +140,7 @@ func (v *JWTVerifier) Verify(ctx context.Context, token string) (contract.Reques
 	return scope.WithToken(token), nil
 }
 
-var capabilities = []string{"catalog.read", "catalog.write", "stock.read", "delivery.create", "analytics.read", "writeoff.confirm", "menu.read", "recommendations.read", "order.prepare", "order.confirm", "order.read", "feedback.submit", "org.read", "org.settings.write", "restaurant.create", "restaurant.delete", "org.delete", "membership.manage", "invitation.manage", "org.summary.read", "runtime.register", "runtime.close", "expiry.due", "consumer.menu.evaluate", "consumer.order.evaluate", "consumer.order.commit", "consumer.order.resolve", "feedback.anonymous.submit", "feedback.read", "feedback.export"}
+var capabilities = []string{"catalog.read", "catalog.write", "stock.read", "delivery.create", "analytics.read", "writeoff.confirm", "menu.read", "recommendations.read", "order.prepare", "order.confirm", "order.read", "feedback.submit", "org.read", "org.settings.write", "restaurant.create", "restaurant.delete", "org.delete", "membership.manage", "invitation.manage", "org.summary.read", "runtime.register", "runtime.close", "expiry.due", "consumer.menu.evaluate", "consumer.order.evaluate", "consumer.order.commit", "consumer.order.resolve", "feedback.anonymous.submit", "feedback.read", "feedback.export", "consumer.recommendations.read"}
 
 func uniqueAllowed(values, allowed []string, max int) bool {
 	if len(values) == 0 || len(values) > max {

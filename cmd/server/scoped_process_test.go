@@ -49,7 +49,7 @@ func s4JSON(t *testing.T, w http.ResponseWriter, value any) {
 	}
 }
 
-func TestS4ProcessFrozenPublicBoundaries(t *testing.T) {
+func TestS4ProcessFIN1PublicBoundaries(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -88,6 +88,7 @@ func TestS4ProcessFrozenPublicBoundaries(t *testing.T) {
 	}))
 	defer auth.Close()
 	at := "2026-10-13T12:00:00+03:00"
+	menuFixture := map[string]any{"evaluatedAt": at, "stateVersion": "9007199254740993", "dishes": []any{map[string]any{"dishID": "1", "dishName": "Dish", "isAvailable": true, "deficits": []any{}, "allocations": []any{map[string]any{"productID": "1", "productName": "Flour", "batchID": "batch", "quantity": "9007199254740993", "baseUnit": "g", "expiresAt": "2026-10-14T12:00:00+03:00"}}}}}
 	positions := []any{map[string]any{"lineNo": "1", "dishID": "1", "portions": "1"}}
 	warehouse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -112,7 +113,9 @@ func TestS4ProcessFrozenPublicBoundaries(t *testing.T) {
 		case "/dish":
 			result = map[string]any{"evaluatedAt": at, "stateVersion": "9007199254740993", "dish": map[string]any{"dishID": "1", "name": "Dish", "ingredients": []any{map[string]any{"productID": "1", "quantity": "9007199254740993", "baseUnit": "g"}}}}
 		case "/menu-evaluation":
-			result = map[string]any{"evaluatedAt": at, "stateVersion": "9007199254740993", "dishes": []any{map[string]any{"dishID": "1", "dishName": "Dish", "isAvailable": true, "deficits": []any{}, "allocations": []any{map[string]any{"productID": "1", "productName": "Flour", "batchID": "batch", "quantity": "9007199254740993", "baseUnit": "g", "expiresAt": "2026-10-14T12:00:00+03:00"}}}}}
+			result = menuFixture
+		case "/recommendation-inputs":
+			result = map[string]any{"evaluatedAt": at, "stateVersion": "9007199254740993", "horizonHours": 72, "window": map[string]any{"from": "2026-10-06T12:00:00+03:00", "to": at, "days": 7}, "coverage": map[string]any{"epoch": s4WarehouseEpoch, "coverageFrom": at, "complete": false, "requestedFrom": "2026-10-06T12:00:00+03:00", "availableFrom": at}, "menu": menuFixture, "riskBatches": []any{map[string]any{"productID": "1", "productName": "Flour", "batchID": "batch", "remainingQuantity": "9007199254740993", "baseUnit": "g", "expiresAt": "2026-10-14T12:00:00+03:00", "remainingSeconds": "86400"}}, "demand": []any{}}
 		case "/commands":
 			result = map[string]any{"found": false}
 		case "/order-attempts":
@@ -233,7 +236,7 @@ func TestS4ProcessFrozenPublicBoundaries(t *testing.T) {
 		{"dish?dishID=1", "servingDish", []string{"menu.read", "catalog.read"}, "ServingScopedDishDetails"},
 		{"menu", "menu", []string{"menu.read", "consumer.menu.evaluate"}, "ServingScopedMenu"},
 		{"stop-list", "stopList", []string{"menu.read", "consumer.menu.evaluate"}, "ServingScopedStopList"},
-		{"recommendations", "recommendations", []string{"recommendations.read", "consumer.menu.evaluate"}, "ServingScopedRecommendations"},
+		{"recommendations", "recommendations", []string{"recommendations.read", "consumer.recommendations.read"}, "ServingScopedRecommendations"},
 	} {
 		w = request("GET", "/internal/serving/v2/r/"+s4Tenant+"/"+tc.path, "s4-gateway", sign(tc.operation, tc.permissions, false), "", "")
 		if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), `"warehouseEpoch":"`+s4WarehouseEpoch+`"`) {
@@ -355,7 +358,7 @@ func TestS4ProcessFrozenPublicBoundaries(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		if e = os.WriteFile(filepath.Join(dir, "wire-responses.json"), data, 0600); e != nil {
+		if e = os.WriteFile(filepath.Join(dir, "fin1-wire-responses.json"), data, 0600); e != nil {
 			t.Fatal(e)
 		}
 	}

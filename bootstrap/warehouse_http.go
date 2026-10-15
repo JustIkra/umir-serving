@@ -22,5 +22,5 @@ func NewScopedWarehouseHTTPPorts(options ScopedWarehouseHTTPOptions) (WarehouseP
 	if err != nil {
 		return WarehousePorts{}, err
 	}
-	return WarehousePorts{Orders: client, Attempts: client, Catalog: client, Menu: client, Epoch: options.Epoch}, nil
+	return WarehousePorts{Orders: client, Attempts: client, Catalog: client, Menu: client, Recommendations: client, Epoch: options.Epoch}, nil
 }

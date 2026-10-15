@@ -188,6 +188,10 @@ func (c *Client) EvaluateMenu(ctx context.Context) (contract.MenuEvaluation, err
 	if err := c.get(ctx, "/menu-evaluation", nil, &response); err != nil {
 		return contract.MenuEvaluation{}, err
 	}
+	return c.menuFromWire(response)
+}
+
+func (c *Client) menuFromWire(response wireMenuEvaluation) (contract.MenuEvaluation, error) {
 	evaluatedAt, err := c.parseTimestamp(response.EvaluatedAt)
 	if err != nil {
 		return contract.MenuEvaluation{}, protocolError(err)
@@ -488,7 +492,7 @@ func (c *Client) request(ctx context.Context, method, path string, query url.Val
 	}
 	if !containsStatus(statuses, response.StatusCode) {
 		if c.scoped != nil {
-			return decodeScopedError(method, response, responseBody)
+			return decodeScopedError(method, path, response, responseBody)
 		}
 		return decodeRemoteError(request.Method, path, response, responseBody)
 	}

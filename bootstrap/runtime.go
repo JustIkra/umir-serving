@@ -35,6 +35,9 @@ func NewInMemory(options Options) (*Runtime, error) {
 	}
 	menu := application.NewMenuService(options.CatalogWarehouse, options.MenuWarehouse)
 	recommendations := application.NewRecommendationsService(options.MenuWarehouse)
+	if !isNil(options.RecommendationsWarehouse) {
+		recommendations = application.NewFINRecommendationsService(options.RecommendationsWarehouse)
+	}
 	stop, cancel := context.WithCancel(context.Background())
 	return &Runtime{orders: orders, menu: menu, recommendations: recommendations, stop: stop, cancel: cancel}, nil
 }

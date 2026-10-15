@@ -23,7 +23,7 @@ func TestS2RefusalAcrossScopedComposition(t *testing.T) {
 	const org = "22222222-2222-4222-8222-222222222222"
 	const epoch = "44444444-4444-4444-8444-444444444444"
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.FixedZone("MSK", 10800))
-	scope := contract.RequestScope{OrgID: org, TenantID: tenant, UserID: "66666666-6666-4666-8666-666666666666", Operation: "recommendations", Permissions: []string{"recommendations.read", "consumer.menu.evaluate"}, TimeZone: "Europe/Moscow", SettingsVersion: "1", LifecycleVersion: "1"}.WithToken("review-token")
+	scope := contract.RequestScope{OrgID: org, TenantID: tenant, UserID: "66666666-6666-4666-8666-666666666666", Operation: "menu", Permissions: []string{"menu.read", "consumer.menu.evaluate"}, TimeZone: "Europe/Moscow", SettingsVersion: "1", LifecycleVersion: "1"}.WithToken("review-token")
 	verifier := s2RefusalVerifier{scope}
 	for code, want := range map[string]int{"InvalidRequest": 400, "ServiceUnavailable": 503, "LimitExceeded": 429, "ProductConflict": 409, "DishConflict": 409} {
 		t.Run(code, func(t *testing.T) {
@@ -51,7 +51,7 @@ func TestS2RefusalAcrossScopedComposition(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			r := httptest.NewRequest("GET", "/internal/serving/v2/r/"+tenant+"/recommendations", nil)
+			r := httptest.NewRequest("GET", "/internal/serving/v2/r/"+tenant+"/menu", nil)
 			r.Header.Set("Authorization", "Bearer review-token")
 			r.Header.Set("X-Umir-Service-Key", "review-gateway-key")
 			w := httptest.NewRecorder()

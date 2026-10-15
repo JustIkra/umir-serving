@@ -116,6 +116,9 @@ type recommendationReasonWire struct {
 	ProductName        string `json:"productName"`
 	BatchID            string `json:"batchID"`
 	QuantityPerPortion string `json:"quantityPerPortion"`
+	RiskQuantity       string `json:"riskQuantity,omitempty"`
+	TargetPortions     string `json:"targetPortions,omitempty"`
+	RemainingSeconds   string `json:"remainingSeconds,omitempty"`
 	BaseUnit           string `json:"baseUnit"`
 	ExpiresAt          string `json:"expiresAt"`
 }
@@ -123,14 +126,34 @@ type recommendationReasonWire struct {
 type recommendationWire struct {
 	DishID            string                     `json:"dishID"`
 	DishName          string                     `json:"dishName"`
+	Score             string                     `json:"score,omitempty"`
+	DemandBasis       string                     `json:"demandBasis,omitempty"`
 	PriorityExpiresAt string                     `json:"priorityExpiresAt"`
 	Reasons           []recommendationReasonWire `json:"reasons"`
 }
 
 type recommendationsWire struct {
-	EvaluatedAt  string               `json:"evaluatedAt"`
-	StateVersion string               `json:"stateVersion"`
-	Items        []recommendationWire `json:"items"`
+	EvaluatedAt   string               `json:"evaluatedAt"`
+	StateVersion  string               `json:"stateVersion"`
+	PolicyVersion string               `json:"policyVersion,omitempty"`
+	HorizonHours  int                  `json:"horizonHours,omitempty"`
+	Window        *planningWindowWire  `json:"window,omitempty"`
+	Coverage      *historyCoverageWire `json:"coverage,omitempty"`
+	Items         []recommendationWire `json:"items"`
+}
+
+type planningWindowWire struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Days int    `json:"days"`
+}
+
+type historyCoverageWire struct {
+	Epoch         string `json:"epoch"`
+	CoverageFrom  string `json:"coverageFrom"`
+	Complete      bool   `json:"complete"`
+	RequestedFrom string `json:"requestedFrom"`
+	AvailableFrom string `json:"availableFrom"`
 }
 
 type confirmWire struct {

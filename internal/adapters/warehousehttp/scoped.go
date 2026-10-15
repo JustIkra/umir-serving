@@ -54,6 +54,8 @@ func (c *Client) authorize(ctx context.Context, method, path string) (contract.R
 	}
 	allowed := false
 	switch {
+	case method == http.MethodGet && path == "/recommendation-inputs":
+		allowed = scope.Allows("consumer.recommendations.read") && scope.Operation == "recommendations"
 	case method == http.MethodGet && (path == "/products" || path == "/dish-catalog" || path == "/dish"):
 		allowed = scope.Allows("catalog.read") && ((path == "/products" && scope.Operation == "servingProducts") || (path == "/dish-catalog" && scope.Operation == "servingDishes") || (path == "/dish" && scope.Operation == "servingDish"))
 	case method == http.MethodGet && path == "/menu-evaluation":
@@ -141,6 +143,13 @@ func (c *Client) validateScopedResult(path string, query url.Values, payload any
 		}
 	}
 	switch path {
+	case "/recommendation-inputs":
+		var input wireRecommendationInputs
+		if err := decodeStrict(data, &input); err != nil {
+			return err
+		}
+		_, err := c.recommendationInputsFromWire(input)
+		return err
 	case "/menu-evaluation":
 		var menu wireMenuEvaluation
 		if err := decodeStrict(data, &menu); err != nil {
@@ -411,7 +420,7 @@ type wireScopedError struct {
 	SessionRevoked *bool `json:"sessionRevoked,omitempty"`
 }
 
-func decodeScopedError(method string, response *http.Response, data []byte) error {
+func decodeScopedError(method, path string, response *http.Response, data []byte) error {
 	if err := requireJSON(response.Header.Get("Content-Type")); err != nil {
 		return exchangeError(method, err)
 	}
@@ -450,8 +459,15 @@ func decodeScopedError(method string, response *http.Response, data []byte) erro
 		status = http.StatusBadGateway
 	case "UpstreamTimeout":
 		status = http.StatusGatewayTimeout
-	case "RateLimited", "LimitExceeded":
+	case "RateLimited":
 		status = http.StatusTooManyRequests
+	case "LimitExceeded":
+		status = http.StatusTooManyRequests
+		if path == "/recommendation-inputs" {
+			status = http.StatusServiceUnavailable
+			value.Code = "CalculationUnavailable"
+			cause = contract.ErrInventoryUnavailable
+		}
 	default:
 		return exchangeError(method, errors.New("unknown scoped warehouse error"))
 	}

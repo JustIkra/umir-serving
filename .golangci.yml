@@ -110,6 +110,7 @@ linters:
             - "maps$"
             - "math$"
             - "math/bits$"
+            - "math/big$"
             - "regexp$"
             - "slices$"
             - "sort$"

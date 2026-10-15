@@ -15,7 +15,7 @@ import (
 	"github.com/JustIkra/umir-serving/contract"
 )
 
-func TestS2ScopedCompositionAndCommittedExpiryFailure(t *testing.T) {
+func TestS2ScopedMenuCompositionAndCommittedExpiryFailure(t *testing.T) {
 	const tenant = "33333333-3333-4333-8333-333333333333"
 	const org = "22222222-2222-4222-8222-222222222222"
 	const epoch = "44444444-4444-4444-8444-444444444444"
@@ -35,7 +35,7 @@ func TestS2ScopedCompositionAndCommittedExpiryFailure(t *testing.T) {
 		}
 		return base64.RawURLEncoding.EncodeToString(b)
 	}
-	claims := map[string]any{"iss": "urn:umir:auth", "aud": []string{"umir-serving", "umir-warehouse"}, "iat": now.Unix(), "nbf": now.Unix(), "exp": now.Unix() + 60, "jti": epoch, "operation": "recommendations", "permissions": []string{"recommendations.read", "consumer.menu.evaluate"}, "kind": "user", "sub": "66666666-6666-4666-8666-666666666666", "sid": "77777777-7777-4777-8777-777777777777", "session_version": "1", "credential_version": "1", "access_version": "1", "org_id": org, "tenant_id": tenant, "time_zone": "Europe/Moscow", "settings_version": "1", "lifecycle_version": "1", "azp": "umir-gateway"}
+	claims := map[string]any{"iss": "urn:umir:auth", "aud": []string{"umir-serving", "umir-warehouse"}, "iat": now.Unix(), "nbf": now.Unix(), "exp": now.Unix() + 60, "jti": epoch, "operation": "menu", "permissions": []string{"menu.read", "consumer.menu.evaluate"}, "kind": "user", "sub": "66666666-6666-4666-8666-666666666666", "sid": "77777777-7777-4777-8777-777777777777", "session_version": "1", "credential_version": "1", "access_version": "1", "org_id": org, "tenant_id": tenant, "time_zone": "Europe/Moscow", "settings_version": "1", "lifecycle_version": "1", "azp": "umir-gateway"}
 	token := func() string {
 		head := encode(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": "test-key"})
 		body := head + "." + encode(claims)
@@ -74,7 +74,7 @@ func TestS2ScopedCompositionAndCommittedExpiryFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := func() *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodGet, "/internal/serving/v2/r/"+tenant+"/recommendations", nil)
+		r := httptest.NewRequest(http.MethodGet, "/internal/serving/v2/r/"+tenant+"/menu", nil)
 		r.Header.Set("Authorization", "Bearer "+token())
 		r.Header.Set("X-Umir-Service-Key", "gateway-key")
 		w := httptest.NewRecorder()

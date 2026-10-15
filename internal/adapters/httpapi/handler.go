@@ -243,15 +243,28 @@ func (h *Handler) getRecommendations(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err, false)
 		return
 	}
-	response := recommendationsWire{EvaluatedAt: formatTime(value.EvaluatedAt), StateVersion: strconv.FormatInt(value.StateVersion, 10), Items: make([]recommendationWire, len(value.Items))}
+	response := recommendationsWire{EvaluatedAt: formatTime(value.EvaluatedAt), StateVersion: strconv.FormatInt(value.StateVersion, 10), PolicyVersion: value.PolicyVersion, HorizonHours: value.HorizonHours, Items: make([]recommendationWire, len(value.Items))}
+	if value.PolicyVersion == "FIN1" {
+		response.Window = &planningWindowWire{formatTime(value.Window.From), formatTime(value.Window.To), value.Window.Days}
+		response.Coverage = &historyCoverageWire{value.Coverage.Epoch, formatTime(value.Coverage.CoverageFrom), value.Coverage.Complete, formatTime(value.Coverage.RequestedFrom), formatTime(value.Coverage.AvailableFrom)}
+	}
 	for index, item := range value.Items {
 		reasons := make([]recommendationReasonWire, len(item.Reasons))
 		for reasonIndex, reason := range item.Reasons {
 			reasons[reasonIndex] = recommendationReasonWire{ProductID: reason.ProductID, ProductName: reason.ProductName, BatchID: reason.BatchID, QuantityPerPortion: strconv.FormatInt(reason.QuantityPerPortion, 10), BaseUnit: reason.BaseUnit, ExpiresAt: formatTime(reason.ExpiresAt)}
+			if value.PolicyVersion == "FIN1" {
+				reasons[reasonIndex].RiskQuantity = strconv.FormatInt(reason.RiskQuantity, 10)
+				reasons[reasonIndex].TargetPortions = strconv.FormatInt(reason.TargetPortions, 10)
+				reasons[reasonIndex].RemainingSeconds = strconv.FormatInt(reason.RemainingSeconds, 10)
+			}
 		}
-		response.Items[index] = recommendationWire{DishID: item.DishID, DishName: item.DishName, PriorityExpiresAt: formatTime(item.PriorityExpiresAt), Reasons: reasons}
+		response.Items[index] = recommendationWire{DishID: item.DishID, DishName: item.DishName, Score: item.Score, DemandBasis: item.DemandBasis, PriorityExpiresAt: formatTime(item.PriorityExpiresAt), Reasons: reasons}
 	}
-	h.writeJSON(w, http.StatusOK, response)
+	limit := 0
+	if value.PolicyVersion == "FIN1" {
+		limit = 16 << 20
+	}
+	h.writeJSONLimited(w, http.StatusOK, response, limit)
 }
 
 func (h *Handler) prepareOrder(w http.ResponseWriter, r *http.Request) {
@@ -519,6 +532,10 @@ func outcomeForError(write bool) string {
 }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, value any) {
+	h.writeJSONLimited(w, status, value, 0)
+}
+
+func (h *Handler) writeJSONLimited(w http.ResponseWriter, status int, value any, limit int) {
 	if h.scopedResponse != nil {
 		h.scopedResponse.preparationHeaders(w)
 	}
@@ -553,6 +570,10 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, value any) {
 			h.writeError(w, &contract.OperationError{Code: "RuntimeNotReady", Message: "verified warehouse context is unavailable", Outcome: outcome}, response.write)
 			return
 		}
+	}
+	if limit > 0 && len(data)+1 > limit {
+		h.writeError(w, &contract.OperationError{Code: "CalculationUnavailable", Message: "Recommendation result exceeds capacity.", Outcome: "unavailable"}, false)
+		return
 	}
 	data = append(data, '\n')
 	w.Header().Set("Content-Type", "application/json")

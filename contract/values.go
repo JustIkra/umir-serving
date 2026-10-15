@@ -225,14 +225,20 @@ type StopListDish struct {
 }
 
 type Recommendations struct {
-	EvaluatedAt  time.Time
-	StateVersion int64
-	Items        []Recommendation
+	EvaluatedAt   time.Time
+	StateVersion  int64
+	PolicyVersion string
+	HorizonHours  int
+	Window        PlanningWindow
+	Coverage      HistoryCoverage
+	Items         []Recommendation
 }
 
 type Recommendation struct {
 	DishID            string
 	DishName          string
+	Score             string
+	DemandBasis       string
 	PriorityExpiresAt time.Time
 	Reasons           []RecommendationReason
 }
@@ -242,6 +248,9 @@ type RecommendationReason struct {
 	ProductName        string
 	BatchID            string
 	QuantityPerPortion int64
+	RiskQuantity       int64
+	TargetPortions     int64
+	RemainingSeconds   int64
 	BaseUnit           string
 	ExpiresAt          time.Time
 }

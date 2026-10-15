@@ -10,11 +10,12 @@ import (
 )
 
 type WarehousePorts struct {
-	Orders   contract.OrdersWarehouse
-	Attempts contract.OrderAttemptReader
-	Catalog  contract.CatalogWarehouse
-	Menu     contract.MenuWarehouse
-	Epoch    string
+	Orders          contract.OrdersWarehouse
+	Attempts        contract.OrderAttemptReader
+	Catalog         contract.CatalogWarehouse
+	Menu            contract.MenuWarehouse
+	Recommendations contract.RecommendationWarehouse
+	Epoch           string
 }
 
 type WarehouseClientFactory func(context.Context, string) (WarehousePorts, error)
@@ -90,7 +91,7 @@ func (r *Registry) Register(ctx context.Context, registration contract.Restauran
 	if ports.Attempts != nil {
 		attempts = proxy
 	}
-	runtime, err := NewInMemory(Options{Now: r.options.Now, NewID: r.options.NewID, OrdersWarehouse: proxy, OrderAttemptReader: attempts, CatalogWarehouse: proxy, MenuWarehouse: proxy})
+	runtime, err := NewInMemory(Options{Now: r.options.Now, NewID: r.options.NewID, OrdersWarehouse: proxy, OrderAttemptReader: attempts, CatalogWarehouse: proxy, MenuWarehouse: proxy, RecommendationsWarehouse: proxy})
 	if err != nil {
 		return err
 	}

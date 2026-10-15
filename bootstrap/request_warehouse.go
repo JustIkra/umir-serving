@@ -87,6 +87,13 @@ func (w *requestWarehouse) DefineDish(ctx context.Context, request contract.Defi
 func (w *requestWarehouse) EvaluateMenu(ctx context.Context) (contract.MenuEvaluation, error) {
 	return w.ports(ctx).Menu.EvaluateMenu(ctx)
 }
+func (w *requestWarehouse) RecommendationInputs(ctx context.Context) (contract.RecommendationInputs, error) {
+	ports := w.ports(ctx)
+	if isNil(ports.Recommendations) {
+		return contract.RecommendationInputs{}, contract.ErrInventoryUnavailable
+	}
+	return ports.Recommendations.RecommendationInputs(ctx)
+}
 func (w *requestWarehouse) FindOrderAttempt(ctx context.Context, commandID, proposalID string) (contract.OrderAttempt, error) {
 	ports := w.ports(ctx)
 	if ports.Attempts == nil {
