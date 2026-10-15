@@ -279,6 +279,12 @@ func (r *Registry) Reconcile(ctx context.Context, snapshot contract.RegistrySnap
 		}
 		seen[entry.TenantID] = entry
 		local, ok := r.restaurants[entry.TenantID]
+		if entry.Lifecycle == "registering" && !ok {
+			// Auth lists the restaurant before its registration reaches this
+			// process. It is not served until installed (Resolve answers
+			// RuntimeNotReady), and it must not close the whole process.
+			continue
+		}
 		if entry.Lifecycle == "ready" || entry.Lifecycle == "registering" {
 			if !ok || local.registration.OrgID != entry.OrgID || local.registration.LifecycleVersion != entry.LifecycleVersion {
 				return &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
