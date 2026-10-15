@@ -71,6 +71,7 @@ func NewProcessHTTP(options ProcessHTTPOptions) (*HTTPHandler, error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		defer auth.Close()
 		delay := time.Second
 		for {
 			attempt, stop := context.WithTimeout(ctx, 5*time.Second)
