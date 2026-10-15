@@ -621,9 +621,7 @@ func TestRecordedOrderBeforeProposalLookup(t *testing.T) {
 func TestRecordedCommandRetryResolvesPending(t *testing.T) {
 	store := memory.NewProposalStore()
 	createProposal(t, store, proposalFixture("proposal-1", 2))
-	if err := store.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
-		t.Fatal(err)
-	}
+	reservePending(t, store, "proposal-1", "command-1")
 	warehouse := newWarehouseFake()
 	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
 	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
@@ -646,9 +644,7 @@ func TestRecordedCommandRetryResolvesPending(t *testing.T) {
 func TestProposalLookupWithDifferentCommandResolvesOriginalPending(t *testing.T) {
 	store := memory.NewProposalStore()
 	createProposal(t, store, proposalFixture("proposal-1", 2))
-	if err := store.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
-		t.Fatal(err)
-	}
+	reservePending(t, store, "proposal-1", "command-1")
 	warehouse := newWarehouseFake()
 	warehouse.ordersByProposal["proposal-1"] = contract.Order{
 		OrderID:    "order-1",
@@ -713,9 +709,7 @@ func TestRecordedOrderReturnsWhenProposalStoreIsUnavailable(t *testing.T) {
 func TestRecordedOrderAtomicallyCompletesMatchingPendingMarker(t *testing.T) {
 	baseStore := memory.NewProposalStore()
 	createProposal(t, baseStore, proposalFixture("proposal-1", 2))
-	if err := baseStore.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
-		t.Fatal(err)
-	}
+	reservePending(t, baseStore, "proposal-1", "command-1")
 	store := baseStore
 	warehouse := newWarehouseFake()
 	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}}
@@ -961,9 +955,7 @@ func TestConfirmRecordedIdentityConflictStopsBeforeProposalLookup(t *testing.T) 
 func TestConflictingRecordedCommandDoesNotClearDifferentPendingMarker(t *testing.T) {
 	store := memory.NewProposalStore()
 	createProposal(t, store, proposalFixture("proposal-1", 2))
-	if err := store.MarkPending(context.Background(), "proposal-1", "command-2"); err != nil {
-		t.Fatal(err)
-	}
+	reservePending(t, store, "proposal-1", "command-2")
 	warehouse := newWarehouseFake()
 	otherOrder := contract.Order{OrderID: "other-order", ProposalID: "other-proposal"}
 	warehouse.recorded["command-1"] = commandRecord("command-1", "other-proposal", otherOrder)
@@ -1179,10 +1171,9 @@ func TestConfirmSupersededProposal(t *testing.T) {
 	store := memory.NewProposalStore()
 	service := newOrdersService(t, store, newWarehouseFake())
 	createProposal(t, store, proposalFixture("proposal-1", 2))
-	if err := store.MarkPending(context.Background(), "proposal-1", "command-1"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Replace(context.Background(), "proposal-1", "command-1", proposalFixture("proposal-2", 1)); err != nil {
+	reservePending(t, store, "proposal-1", "command-1")
+	replacement := proposalFixture("proposal-2", 1)
+	if err := store.CompleteAttempt(context.Background(), "command-1", contract.ConfirmResult{Kind: contract.ProposalSuperseded, SupersededBy: "proposal-2"}, nil, &replacement); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1300,6 +1291,36 @@ func proposalFixture(proposalID string, portions int64) domain.OrderProposal {
 	proposal.AcceptedPositions[0].Portions = portions
 	proposal.RequestedPositions[0].Portions = portions
 	return proposal
+}
+
+// reservePending records a confirmation attempt for the command and makes it
+// the proposal's pending owner, the way ConfirmOrder does before a commit.
+func reservePending(t *testing.T, store *memory.ProposalStore, proposalID, commandID string) {
+	t.Helper()
+	record, ok, err := store.Get(context.Background(), proposalID)
+	if err != nil || !ok {
+		t.Fatalf("Get(%q) = (%v, %v), want record", proposalID, ok, err)
+	}
+	attempt := contract.ConfirmationAttempt{
+		CommandID:         commandID,
+		ProposalID:        proposalID,
+		Fingerprint:       confirmFingerprint(proposalID),
+		AcceptedPositions: toAcceptedPositions(record.Proposal.AcceptedPositions),
+	}
+	if _, _, err := store.BeginAttempt(context.Background(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveAttempt(context.Background(), commandID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func toAcceptedPositions(positions []domain.AcceptedPosition) []contract.AcceptedPosition {
+	accepted := make([]contract.AcceptedPosition, len(positions))
+	for i, position := range positions {
+		accepted[i] = contract.AcceptedPosition(position)
+	}
+	return accepted
 }
 
 func createProposal(t *testing.T, store application.ProposalStore, proposal domain.OrderProposal) {
