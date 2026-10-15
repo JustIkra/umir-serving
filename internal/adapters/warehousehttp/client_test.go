@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -378,4 +381,110 @@ func writeResponse(t *testing.T, w http.ResponseWriter, body string) {
 
 func structCommitRequest() contract.CommitOrderRequest {
 	return contract.CommitOrderRequest{CommandID: "c1", ProposalID: "p1", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d1", Portions: 1}}}
+}
+
+func TestDefaultTransportKeepsIdleConnectionsForTheWarehouseHost(t *testing.T) {
+	const batchSize = 32
+	var (
+		mu       sync.Mutex
+		opened   int
+		idle     int
+		arrived  int
+		gate     chan struct{}
+		releaseT = 5 * time.Second
+	)
+	newGate := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		arrived = 0
+		gate = make(chan struct{})
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		arrived++
+		current := gate
+		if arrived == batchSize {
+			close(current)
+		}
+		mu.Unlock()
+		// Hold the response until the whole batch is in flight, so every request needs its own connection.
+		select {
+		case <-current:
+		case <-time.After(releaseT):
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeResponse(t, w, `{"evaluatedAt":"2026-10-11T12:00:00+03:00","stateVersion":"1","items":[]}`)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch state {
+		case http.StateNew:
+			opened++
+		case http.StateIdle:
+			idle++
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	client, err := NewClient(server.URL, nil, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.http.CloseIdleConnections()
+
+	runBatch := func(name string) {
+		newGate()
+		var wg sync.WaitGroup
+		errs := make(chan error, batchSize)
+		for range batchSize {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := client.GetProducts(context.Background())
+				errs <- err
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("%s batch: GetProducts() = %v", name, err)
+			}
+		}
+	}
+
+	runBatch("first")
+	mu.Lock()
+	if arrived != batchSize {
+		mu.Unlock()
+		t.Fatalf("first batch was not parallel: %d requests in flight together, want %d", arrived, batchSize)
+	}
+	mu.Unlock()
+	// The pool takes the connections back after the response is read; wait for the server to see them idle.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		count := idle
+		mu.Unlock()
+		if count >= batchSize {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d connections went idle after the first batch, want %d", count, batchSize)
+		}
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+	}
+	runBatch("second")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if arrived != batchSize {
+		t.Fatalf("second batch was not parallel: %d requests in flight together, want %d", arrived, batchSize)
+	}
+	if opened > batchSize+8 {
+		t.Fatalf("two batches of %d requests opened %d connections, want at most %d: idle connections for the Warehouse host were not kept", batchSize, opened, batchSize+8)
+	}
 }
