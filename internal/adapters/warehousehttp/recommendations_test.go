@@ -45,11 +45,12 @@ func finArray(t *testing.T, value any) []any {
 
 func TestFINRecommendationInputsStrictBoundary(t *testing.T) {
 	for name, mutate := range map[string]func(map[string]any){
-		"valid":            func(map[string]any) {},
-		"unknown":          func(v map[string]any) { finMap(t, v["result"])["extra"] = true },
-		"epoch":            func(v map[string]any) { finMap(t, finMap(t, v["result"])["coverage"])["epoch"] = s2Other },
-		"missing-complete": func(v map[string]any) { delete(finMap(t, finMap(t, v["result"])["coverage"]), "complete") },
-		"menu-version":     func(v map[string]any) { finMap(t, finMap(t, v["result"])["menu"])["stateVersion"] = "43" },
+		"legacy-context-field": func(v map[string]any) { finMap(t, v["context"])["warehouseEpoch"] = s2Epoch },
+		"valid":                func(map[string]any) {},
+		"unknown":              func(v map[string]any) { finMap(t, v["result"])["extra"] = true },
+		"epoch":                func(v map[string]any) { finMap(t, finMap(t, v["result"])["coverage"])["epoch"] = s2Other },
+		"missing-complete":     func(v map[string]any) { delete(finMap(t, finMap(t, v["result"])["coverage"]), "complete") },
+		"menu-version":         func(v map[string]any) { finMap(t, finMap(t, v["result"])["menu"])["stateVersion"] = "43" },
 		"quantity-overflow": func(v map[string]any) {
 			finMap(t, finArray(t, finMap(t, v["result"])["riskBatches"])[0])["remainingQuantity"] = "9223372036854775808"
 		},

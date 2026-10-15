@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Refuse legacy optional envelope fields on the closed FIN1 recommendation-input context before recording its observation. Preserve existing compatibility decoding for unrelated requests.
+
 - Add the scoped FIN1 recommendation policy and strict coherent Warehouse input port. Rank with exact urgency, risky portion share and consumption factors, using explicit history/fallback demand and finite explanatory values. Keep selected legacy v1 behavior and its tests separate. FIN1 consumers must adopt the composed response profile and narrow recommendation permission together.
 
 - Recover a retained scoped confirmation after a verified unseen owner attempt by submitting the exact saved command once in the same epoch and unchanged scope/settings. Keep passive Resolve, pending-owner suppression, recorded-outcome replay and reset/indeterminate behavior. Bound redelivery to ten seconds and preserve proposal serialization.

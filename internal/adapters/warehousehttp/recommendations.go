@@ -2,6 +2,7 @@ package warehousehttp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/JustIkra/umir-serving/contract"
@@ -45,6 +46,21 @@ type wireRecommendationInputs struct {
 	Menu         wireMenuEvaluation  `json:"menu"`
 	RiskBatches  []wireRiskBatch     `json:"riskBatches"`
 	Demand       []wireDishDemand    `json:"demand"`
+}
+
+func validateFINEnvelope(data []byte) error {
+	var envelope struct {
+		Context struct {
+			OrgID        string       `json:"orgID"`
+			TenantID     string       `json:"tenantID"`
+			RuntimeEpoch string       `json:"runtimeEpoch"`
+			Settings     wireSettings `json:"settings"`
+			EvaluatedAt  string       `json:"evaluatedAt"`
+			StateVersion string       `json:"stateVersion"`
+		} `json:"context"`
+		Result json.RawMessage `json:"result"`
+	}
+	return decodeStrict(data, &envelope)
 }
 
 func (c *Client) RecommendationInputs(ctx context.Context) (contract.RecommendationInputs, error) {

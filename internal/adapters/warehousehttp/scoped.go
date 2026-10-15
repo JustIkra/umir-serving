@@ -93,6 +93,11 @@ type wireEnvelope struct {
 }
 
 func (c *Client) decodeScoped(ctx context.Context, scope contract.RequestScope, path string, query url.Values, payload any, data []byte, output any) error {
+	if path == "/recommendation-inputs" {
+		if err := validateFINEnvelope(data); err != nil {
+			return protocolError(err)
+		}
+	}
 	var envelope wireEnvelope
 	if err := decodeStrict(data, &envelope); err != nil {
 		return protocolError(err)
