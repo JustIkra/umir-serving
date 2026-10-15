@@ -279,10 +279,11 @@ func (r *Registry) Reconcile(ctx context.Context, snapshot contract.RegistrySnap
 		}
 		seen[entry.TenantID] = entry
 		local, ok := r.restaurants[entry.TenantID]
-		if entry.Lifecycle == "registering" && !ok {
+		if _, closedLocally := r.closed[entry.TenantID]; entry.Lifecycle == "registering" && !ok && !closedLocally {
 			// Auth lists the restaurant before its registration reaches this
 			// process. It is not served until installed (Resolve answers
 			// RuntimeNotReady), and it must not close the whole process.
+			// A restaurant closed locally is different: it stays an error.
 			continue
 		}
 		if entry.Lifecycle == "ready" || entry.Lifecycle == "registering" {

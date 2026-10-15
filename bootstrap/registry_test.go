@@ -345,6 +345,32 @@ func TestReconcileKeepsReadyWhileAnotherRestaurantIsRegistering(t *testing.T) {
 	if _, _, err = registry.Resolve(t.Context(), contract.RequestScope{OrgID: orgA, TenantID: tenantA, LifecycleVersion: "1"}); err != nil {
 		t.Fatalf("neighbor restaurant stopped working: %v", err)
 	}
+	// The skipped entry still advanced the revision: revision 1 is now a rollback.
+	if err = registry.Reconcile(t.Context(), contract.RegistrySnapshot{Revision: "1", Complete: true, Entries: snapshot.Entries}); err == nil || registry.Status().Ready {
+		t.Fatalf("revision rollback after a skipped registering entry: err=%v ready=%v", err, registry.Status().Ready)
+	}
+	snapshot.Revision = "3"
+	if err = registry.Reconcile(t.Context(), snapshot); err != nil || !registry.Status().Ready {
+		t.Fatalf("newer revision after a rollback: err=%v ready=%v", err, registry.Status().Ready)
+	}
+}
+
+func TestReconcileRegisteringForLocallyClosedRestaurantIsNotReady(t *testing.T) {
+	registry := newReconcileRegistry(t)
+	if err := registry.Reconcile(t.Context(), contract.RegistrySnapshot{Revision: "1", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "ready")}}); err != nil {
+		t.Fatal(err)
+	}
+	closeRequest := contract.RestaurantRegistration{OrgID: orgA, TenantID: tenantA, OperationID: operationA, ExpectedEpoch: epochA, LifecycleVersion: "2"}
+	if err := registry.Close(t.Context(), closeRequest); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := contract.RegistrySnapshot{Revision: "2", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "registering")}}
+	if err := registry.Reconcile(t.Context(), snapshot); err == nil {
+		t.Fatal("registering entry for a locally closed restaurant was skipped")
+	}
+	if registry.Status().Ready {
+		t.Fatal("registry stayed ready")
+	}
 }
 
 func TestReconcileStillRequiresProcessReadinessFacts(t *testing.T) {
