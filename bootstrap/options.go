@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/JustIkra/umir-serving/contract"
@@ -14,4 +15,5 @@ type Options struct {
 	CatalogWarehouse         contract.CatalogWarehouse
 	MenuWarehouse            contract.MenuWarehouse
 	RecommendationsWarehouse contract.RecommendationWarehouse
+	Logger                   *slog.Logger
 }

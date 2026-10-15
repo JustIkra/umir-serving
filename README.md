@@ -212,10 +212,28 @@ The local Compose file builds only Serving. It exposes port 8080 to its private 
 | `REQUEST_TIMEOUT` | `12s` |
 | `REGISTRY_POLL_INTERVAL` | `30s`; positive, at most 30 seconds |
 | `MAX_REQUEST_BYTES` | `1048576`; positive, at most 1 MiB |
+| `SERVING_INSTANCE_ID` | Optional replica name (letters, digits, `.`, `_`, `-`, up to 64 characters); a random UUID of the process if unset. Written as `instance_id` in logs |
 
 Do not reuse one key across caller pairs. URLs must be private trusted endpoints; Auth takes an origin without a path. Use certificate/hostname-validated TLS outside the isolated test network. No secret value belongs in source or logs. Programmatic `ProcessHTTPOptions` exposes the same configuration plus injected epoch, clock, ID source and optional HTTP client.
 
 Общая сборка и команды запуска описаны в [README фабрики](https://github.com/JustIkra/umir-factory#readme).
+
+## Structured logs
+
+The process writes one JSON object per line to stdout (`bootstrap.NewLogger`). Every record has `time` (`+03:00`), `level`, `msg` (equal to `event`, except for `http.server_error`), `event`, `log_schema_version` (1), `service` (`umir-serving`), `version` (VCS revision or `unknown`) and `instance_id`, as in the factory observability format. Records carry identifiers, codes and versions only: no tokens, `Authorization`, request or response bodies, error texts, user IDs or network addresses. Client-supplied IDs are cut at 256 characters. The one exception is `http.server_error`, which relays `net/http` internal messages (for example a handler panic) and may contain the peer address. Every logger is an injected `*slog.Logger` (`Logger` options of `ProcessHTTPOptions`, `HTTPOptions`, `RegistryOptions`, `ScopedHTTPOptions`, `ScopedOptions`, `OrdersService.WithLogger`); the default discards.
+
+| Event | Level | Fields besides the common ones |
+| --- | --- | --- |
+| `confirmation.unknown` | `ERROR` (`WARN` for `ProposalNotFound`) | `operation` (`confirm`/`resolve`), `command_id`, `proposal_id`, `tenant_id`, `org_id`, `runtime_epoch`, `warehouse_epoch`, `settings_version`, `error_code`, `outcome` (`unknown`/`indeterminate`), `cause` (`deadline`/`canceled`, optional) |
+| `confirmation.pending.started` | `INFO` | as above; the call reserved the attempt and ended without an outcome |
+| `confirmation.pending.resolved` | `INFO` | as above plus `result` (result kind or error code); a retained pending attempt reached an outcome |
+| `warehouse.protocol_error` | `ERROR` | `tenant_id`, `operation`, `warehouse_epoch`, `error_code` |
+| `reconcile.failed` | `ERROR`; `WARN` for `registering_not_installed` and for a failed Auth or key fetch | `reason`, `error_code`, `revision`, and `tenant_id`, `org_id`, `lifecycle_version` when one entry is at fault |
+| `registry.tenant_mismatch` | `WARN` | `where` (`reconcile`/`resolve`), `reason` (`org_mismatch`/`lifecycle_mismatch`), `tenant_id`, `registered_org_id`, `presented_org_id`, `registered_lifecycle_version`, `presented_lifecycle_version` |
+| `http.response_failed` | `WARN`; `ERROR` for encoding | `stage`, `error_kind` |
+| `process.started`, `process.stopped`, `process.start_failed`, `process.failed`, `http.server_error` | `INFO`/`ERROR` | `port`, `error` (startup errors only) |
+
+`reconcile.failed` reasons: `registering_not_installed` (Auth lists a registering restaurant not yet installed here; skipped, logged once per entry, readiness unaffected), `snapshot_invalid`, `revision_invalid`, `revision_rollback`, `invalid_entry`, `ready_not_installed`, `registering_closed_locally`, `tombstone_not_applied`, `tenant_mismatch`, `local_missing_from_snapshot`, `context_done`, and, from the poll loop, `auth_registry_unavailable` and `signing_keys_unavailable`.
 
 ## Совместная работа
 

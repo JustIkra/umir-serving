@@ -125,6 +125,7 @@ linters:
             - "crypto/sha256$"
             - "encoding/hex$"
             - "encoding/json$"
+            - "log/slog$"
             - "github.com/JustIkra/umir-serving/internal/domain/"
             - "github.com/JustIkra/umir-serving/internal/domain$"
             - "github.com/JustIkra/umir-serving/contract/"

@@ -33,6 +33,7 @@ func NewInMemory(options Options) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	orders.WithLogger(options.Logger)
 	menu := application.NewMenuService(options.CatalogWarehouse, options.MenuWarehouse)
 	recommendations := application.NewRecommendationsService(options.MenuWarehouse)
 	if !isNil(options.RecommendationsWarehouse) {

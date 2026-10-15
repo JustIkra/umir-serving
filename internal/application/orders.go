@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type OrdersService struct {
 	attemptReader contract.OrderAttemptReader
 	now           func() time.Time
 	newID         func() string
+	log           *slog.Logger
 	locksMu       sync.Mutex
 	locks         map[string]*proposalLock
 }
@@ -41,6 +43,7 @@ func NewOrdersService(store ProposalStore, warehouse contract.OrdersWarehouse, n
 		warehouse: warehouse,
 		now:       now,
 		newID:     newID,
+		log:       slog.New(slog.DiscardHandler),
 		locks:     make(map[string]*proposalLock),
 	}
 	if len(readers) > 1 {

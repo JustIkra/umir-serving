@@ -6,11 +6,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"time"
@@ -26,7 +30,12 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// handler assembles the process handler with logging discarded.
 func handler() (*bootstrap.HTTPHandler, error) {
+	return handlerWithLogger(slog.New(slog.DiscardHandler))
+}
+
+func handlerWithLogger(logger *slog.Logger) (*bootstrap.HTTPHandler, error) {
 	requestTimeout, err := durationSetting("REQUEST_TIMEOUT", "12s")
 	if err != nil {
 		return nil, err
@@ -59,6 +68,7 @@ func handler() (*bootstrap.HTTPHandler, error) {
 			MaxRequestBytes:      maxRequestBytes,
 			Now:                  func() time.Time { return time.Now().In(location) },
 			NewID:                newID,
+			Logger:               logger,
 		},
 		AuthInternalURL:      os.Getenv("AUTH_INTERNAL_URL"),
 		AuthTimeout:          authTimeout,
@@ -67,7 +77,7 @@ func handler() (*bootstrap.HTTPHandler, error) {
 		GatewayServingKey:    os.Getenv("GATEWAY_SERVING_KEY"),
 		ServingWarehouseKey:  os.Getenv("SERVING_WAREHOUSE_KEY"),
 		TZDataVersion:        os.Getenv("TZDATA_VERSION"),
-		Epoch:                newEpoch(),
+		Epoch:                newUUID(),
 		RegistryPollInterval: pollInterval,
 	})
 	if err != nil {
@@ -111,7 +121,7 @@ func newID() string {
 	return hex.EncodeToString(value[:])
 }
 
-func newEpoch() string {
+func newUUID() string {
 	var value [16]byte
 	if _, err := cryptorand.Read(value[:]); err != nil {
 		return ""
@@ -119,6 +129,49 @@ func newEpoch() string {
 	value[6] = (value[6] & 0x0f) | 0x40
 	value[8] = (value[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", value[:4], value[4:6], value[6:8], value[8:10], value[10:])
+}
+
+var instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// instanceID returns SERVING_INSTANCE_ID when it is set, and a random UUID of
+// this process otherwise.
+func instanceID() (string, error) {
+	value, set := os.LookupEnv("SERVING_INSTANCE_ID")
+	if !set || value == "" {
+		return newUUID(), nil
+	}
+	if !instanceIDPattern.MatchString(value) {
+		return newUUID(), fmt.Errorf("invalid SERVING_INSTANCE_ID")
+	}
+	return value, nil
+}
+
+// buildVersion is the VCS revision the binary was built from, or unknown.
+func buildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" && setting.Value != "" {
+				return setting.Value
+			}
+		}
+	}
+	return "unknown"
+}
+
+// startupErrorText is the error text for process lifecycle records. A
+// *url.Error repeats the whole URL, which can carry credentials, so only its
+// operation and cause are kept.
+func startupErrorText(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Op + ": " + urlErr.Err.Error()
+	}
+	return err.Error()
+}
+
+func fatal(logger *slog.Logger, event string, err error) {
+	logger.Error(event, slog.String("event", event), slog.String("error", startupErrorText(err)))
+	os.Exit(1)
 }
 
 func healthcheck() (result error) {
@@ -162,22 +215,32 @@ func serveHTTP(server *http.Server, app idleConnectionCloser, signals context.Co
 	return <-shutdownDone
 }
 
+func newProcessLogger(w io.Writer) (*slog.Logger, error) {
+	id, err := instanceID()
+	return bootstrap.NewLogger(w, id, buildVersion(), slog.LevelInfo), err
+}
+
 func main() {
+	logger, idErr := newProcessLogger(os.Stdout)
+	if idErr != nil {
+		fatal(logger, "process.start_failed", idErr)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		if err := healthcheck(); err != nil {
-			log.Fatal(err)
+			fatal(logger, "process.healthcheck_failed", err)
 		}
 		return
 	}
 	port, err := serverPort()
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "process.start_failed", err)
 	}
-	app, err := handler()
+	app, err := handlerWithLogger(logger)
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "process.start_failed", err)
 	}
 	server := &http.Server{
+		ErrorLog:          slog.NewLogLogger(logger.With(slog.String("event", "http.server_error")).Handler(), slog.LevelError),
 		Addr:              net.JoinHostPort("", strconv.Itoa(port)),
 		Handler:           app,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -185,8 +248,9 @@ func main() {
 	}
 	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("umir-serving listening on %s", server.Addr)
+	logger.Info("process.started", slog.String("event", "process.started"), slog.Int("port", port))
 	if err := serveHTTP(server, app, signals, stop, server.ListenAndServe); err != nil {
-		log.Fatal(err)
+		fatal(logger, "process.failed", err)
 	}
+	logger.Info("process.stopped", slog.String("event", "process.stopped"))
 }

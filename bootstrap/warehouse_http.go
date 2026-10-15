@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -15,10 +16,11 @@ type ScopedWarehouseHTTPOptions struct {
 	Epoch                string
 	ServiceKey           string
 	Verifier             TokenVerifier
+	Logger               *slog.Logger
 }
 
 func NewScopedWarehouseHTTPPorts(options ScopedWarehouseHTTPOptions) (WarehousePorts, error) {
-	client, err := warehousehttp.NewScopedClient(options.WarehouseInternalURL, options.HTTPClient, options.WarehouseTimeout, warehousehttp.ScopedOptions{TenantID: options.TenantID, Epoch: options.Epoch, ServiceKey: options.ServiceKey, Verifier: options.Verifier})
+	client, err := warehousehttp.NewScopedClient(options.WarehouseInternalURL, options.HTTPClient, options.WarehouseTimeout, warehousehttp.ScopedOptions{TenantID: options.TenantID, Epoch: options.Epoch, ServiceKey: options.ServiceKey, Verifier: options.Verifier, Logger: options.Logger})
 	if err != nil {
 		return WarehousePorts{}, err
 	}

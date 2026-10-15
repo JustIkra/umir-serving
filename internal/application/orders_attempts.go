@@ -16,6 +16,13 @@ const (
 )
 
 func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
+	trace := newConfirmTrace("confirm", request)
+	result, err := s.confirmWithAttemptsTraced(ctx, request, trace)
+	s.logConfirmOutcome(ctx, trace, result, err)
+	return result, err
+}
+
+func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request contract.ConfirmOrderRequest, trace *confirmTrace) (contract.ConfirmResult, error) {
 	if request.CommandID == "" || request.ProposalID == "" {
 		return contract.ConfirmResult{}, contract.ErrInvalidArgument
 	}
@@ -37,6 +44,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		return contract.ConfirmResult{}, err
 	}
 	if found {
+		trace.observeAttempt(attempt)
 		if err := requireSavedEpoch(ctx, attempt.Context); err != nil {
 			return contract.ConfirmResult{}, err
 		}
@@ -68,6 +76,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 	savedContext := contract.WarehouseContext{}
 	if scopeFound {
 		savedContext = attemptContext(ctx, proposalForScope.Proposal)
+		trace.observeSavedContext(savedContext)
 		if err := requireSavedEpoch(ctx, savedContext); err != nil {
 			return contract.ConfirmResult{}, err
 		}
@@ -170,6 +179,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		}
 		return contract.ConfirmResult{}, mapAttemptStoreError(err)
 	}
+	trace.reserved = true
 	attempt, _, err = s.attempts.GetAttempt(ctx, request.CommandID)
 	if err != nil {
 		return contract.ConfirmResult{}, err
@@ -338,6 +348,13 @@ func (s *OrdersService) completeRejectedAttempt(ctx context.Context, attempt con
 }
 
 func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
+	trace := newConfirmTrace("resolve", request)
+	result, err := s.resolveConfirmation(ctx, request, trace)
+	s.logConfirmOutcome(ctx, trace, result, err)
+	return result, err
+}
+
+func (s *OrdersService) resolveConfirmation(ctx context.Context, request contract.ConfirmOrderRequest, trace *confirmTrace) (contract.ConfirmResult, error) {
 	if request.CommandID == "" || request.ProposalID == "" {
 		return contract.ConfirmResult{}, contract.ErrInvalidArgument
 	}
@@ -360,6 +377,7 @@ func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contrac
 	if !found {
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	}
+	trace.observeAttempt(attempt)
 	if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 		return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 	}

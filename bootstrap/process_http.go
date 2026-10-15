@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/JustIkra/umir-serving/contract"
@@ -37,6 +38,7 @@ func NewProcessHTTP(options ProcessHTTPOptions) (*HTTPHandler, error) {
 			}
 		}
 	}
+	logger := nopLogger(options.Logger)
 	client := options.HTTPClient
 	if client == nil {
 		client = warehousehttp.NewHTTPClient()
@@ -54,16 +56,16 @@ func NewProcessHTTP(options ProcessHTTPOptions) (*HTTPHandler, error) {
 		if err != nil {
 			return WarehousePorts{}, err
 		}
-		return NewScopedWarehouseHTTPPorts(ScopedWarehouseHTTPOptions{WarehouseInternalURL: options.WarehouseInternalURL, WarehouseTimeout: options.WarehouseTimeout, HTTPClient: client, TenantID: tenant, Epoch: epoch, ServiceKey: options.ServingWarehouseKey, Verifier: verifier})
+		return NewScopedWarehouseHTTPPorts(ScopedWarehouseHTTPOptions{WarehouseInternalURL: options.WarehouseInternalURL, WarehouseTimeout: options.WarehouseTimeout, HTTPClient: client, TenantID: tenant, Epoch: epoch, ServiceKey: options.ServingWarehouseKey, Verifier: verifier, Logger: logger})
 	}
 	if _, err = warehousehttp.NewClient(options.WarehouseInternalURL, client, options.WarehouseTimeout); err != nil {
 		return nil, err
 	}
-	registry, err := NewRegistry(RegistryOptions{Epoch: options.Epoch, Now: options.Now, NewID: options.NewID, WarehouseFactory: factory})
+	registry, err := NewRegistry(RegistryOptions{Epoch: options.Epoch, Now: options.Now, NewID: options.NewID, WarehouseFactory: factory, Logger: logger})
 	if err != nil {
 		return nil, err
 	}
-	handler, err := NewScopedHTTP(ScopedHTTPOptions{Registry: registry, Verifier: verifier, GatewayKey: options.GatewayServingKey, AuthKey: options.AuthRuntimeKey, TZDataVersion: options.TZDataVersion, RequestTimeout: options.RequestTimeout, MaxRequestBytes: options.MaxRequestBytes, Now: options.Now})
+	handler, err := NewScopedHTTP(ScopedHTTPOptions{Registry: registry, Verifier: verifier, GatewayKey: options.GatewayServingKey, AuthKey: options.AuthRuntimeKey, TZDataVersion: options.TZDataVersion, RequestTimeout: options.RequestTimeout, MaxRequestBytes: options.MaxRequestBytes, Now: options.Now, Logger: logger})
 	if err != nil {
 		return nil, err
 	}
@@ -75,14 +77,22 @@ func NewProcessHTTP(options ProcessHTTPOptions) (*HTTPHandler, error) {
 		delay := time.Second
 		for {
 			attempt, stop := context.WithTimeout(ctx, 5*time.Second)
+			// reason names a step that failed before Reconcile ran; Reconcile
+			// records its own reasons.
+			reason := "auth_registry_unavailable"
 			snapshot, err := auth.Registry(attempt)
 			if err == nil {
+				reason = "signing_keys_unavailable"
 				err = auth.CheckSigningKeys(attempt)
 			}
 			if err == nil {
+				reason = ""
 				err = registry.Reconcile(attempt, snapshot.Projection())
 			}
 			if err != nil {
+				if reason != "" && ctx.Err() == nil {
+					logger.LogAttrs(ctx, slog.LevelWarn, EventReconcileFailed, slog.String("event", EventReconcileFailed), slog.String("reason", reason), slog.String("error_code", errorCode(err)))
+				}
 				registry.mu.Lock()
 				registry.ready = false
 				registry.mu.Unlock()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -22,6 +23,7 @@ type ScopedOptions struct {
 	Epoch      string
 	ServiceKey string
 	Verifier   TokenVerifier
+	Logger     *slog.Logger
 }
 
 func NewScopedClient(baseURL string, client *http.Client, timeout time.Duration, options ScopedOptions) (*Client, error) {
@@ -33,6 +35,7 @@ func NewScopedClient(baseURL string, client *http.Client, timeout time.Duration,
 		return nil, err
 	}
 	c.scoped = &options
+	c.log = options.Logger
 	return c, nil
 }
 
@@ -95,17 +98,17 @@ type wireEnvelope struct {
 func (c *Client) decodeScoped(ctx context.Context, scope contract.RequestScope, path string, query url.Values, payload any, data []byte, output any) error {
 	if path == "/recommendation-inputs" {
 		if err := validateFINEnvelope(data); err != nil {
-			return protocolError(err)
+			return c.protocolFailure(ctx, err)
 		}
 	}
 	var envelope wireEnvelope
 	if err := decodeStrict(data, &envelope); err != nil {
-		return protocolError(err)
+		return c.protocolFailure(ctx, err)
 	}
 	m := envelope.Context
 	at, err := parseInstant(m.EvaluatedAt)
 	if err != nil {
-		return protocolError(err)
+		return c.protocolFailure(ctx, err)
 	}
 	expectedEpoch := c.scoped.Epoch
 	expectedZone, expectedVersion := scope.TimeZone, scope.SettingsVersion
@@ -113,7 +116,7 @@ func (c *Client) decodeScoped(ctx context.Context, scope contract.RequestScope, 
 	checkSettings := true
 	if binding, ok := contract.WarehouseBindingFromContext(ctx); ok {
 		if binding.Context.OrgID != scope.OrgID || binding.Context.TenantID != scope.TenantID || !contract.ValidEntityID(binding.Context.Epoch) {
-			return protocolError(errors.New("invalid retained warehouse scope"))
+			return c.protocolFailure(ctx, errors.New("invalid retained warehouse scope"))
 		}
 		expectedEpoch = binding.Context.Epoch
 		if binding.Retained {
@@ -131,13 +134,13 @@ func (c *Client) decodeScoped(ctx context.Context, scope contract.RequestScope, 
 	}
 	version, err := parseInt64(m.StateVersion, false)
 	if err != nil || m.OrgID != scope.OrgID || m.TenantID != scope.TenantID || m.RuntimeEpoch != expectedEpoch || (m.WarehouseEpoch != "" && m.WarehouseEpoch != m.RuntimeEpoch) || (checkSettings && (m.Settings.TimeZone != expectedZone || m.Settings.SettingsVersion != expectedVersion)) {
-		return protocolError(errors.New("warehouse context differs from selected scope"))
+		return c.protocolFailure(ctx, errors.New("warehouse context differs from selected scope"))
 	}
 	if err := decodeStrict(envelope.Result, output); err != nil {
-		return protocolError(err)
+		return c.protocolFailure(ctx, err)
 	}
 	if err := c.validateScopedResult(path, query, payload, envelope.Result, at, version); err != nil {
-		return protocolError(err)
+		return c.protocolFailure(ctx, err)
 	}
 	contract.RecordWarehouseContext(ctx, contract.WarehouseContext{OrgID: m.OrgID, TenantID: m.TenantID, Epoch: m.RuntimeEpoch, TimeZone: recordedZone, SettingsVersion: recordedVersion, EvaluatedAt: at, StateVersion: version})
 	return nil

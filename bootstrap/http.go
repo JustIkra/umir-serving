@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -18,6 +19,7 @@ type HTTPOptions struct {
 	Now                  func() time.Time
 	NewID                func() string
 	HTTPClient           *http.Client
+	Logger               *slog.Logger
 }
 
 type HTTPHandler struct {
@@ -49,11 +51,12 @@ func NewHTTP(options HTTPOptions) (*Runtime, *HTTPHandler, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	runtime, err := NewInMemory(Options{Now: options.Now, NewID: options.NewID, OrdersWarehouse: warehouse, CatalogWarehouse: warehouse, MenuWarehouse: warehouse, OrderAttemptReader: warehouse})
+	warehouse.WithLogger(options.Logger)
+	runtime, err := NewInMemory(Options{Now: options.Now, NewID: options.NewID, OrdersWarehouse: warehouse, CatalogWarehouse: warehouse, MenuWarehouse: warehouse, OrderAttemptReader: warehouse, Logger: options.Logger})
 	if err != nil {
 		return nil, nil, err
 	}
-	handler, err := httpapi.NewHandler(runtime, httpapi.Options{RequestTimeout: options.RequestTimeout, MaxRequestBytes: options.MaxRequestBytes})
+	handler, err := httpapi.NewHandler(runtime, httpapi.Options{RequestTimeout: options.RequestTimeout, MaxRequestBytes: options.MaxRequestBytes, Logger: options.Logger})
 	if err != nil {
 		return nil, nil, err
 	}

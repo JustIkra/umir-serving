@@ -2,6 +2,8 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -25,6 +27,7 @@ type RegistryOptions struct {
 	Now              func() time.Time
 	NewID            func() string
 	WarehouseFactory WarehouseClientFactory
+	Logger           *slog.Logger
 }
 
 type restaurantRuntime struct {
@@ -41,13 +44,18 @@ type Registry struct {
 	revision    string
 	ready       bool
 	registering chan struct{}
+	log         *slog.Logger
+	// skipLogged remembers which registering entries not yet installed here
+	// were already logged, so a poll loop writes each one once.
+	skipLogged map[string]string
 }
 
 func NewRegistry(options RegistryOptions) (*Registry, error) {
 	if !contract.ValidEntityID(options.Epoch) || options.Now == nil || options.NewID == nil || options.WarehouseFactory == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &Registry{options: options, restaurants: make(map[string]restaurantRuntime), closed: make(map[string]restaurantRuntime), registering: make(chan struct{}, 1)}, nil
+	options.Logger = nopLogger(options.Logger)
+	return &Registry{options: options, log: options.Logger, restaurants: make(map[string]restaurantRuntime), closed: make(map[string]restaurantRuntime), registering: make(chan struct{}, 1), skipLogged: make(map[string]string)}, nil
 }
 
 func (r *Registry) Register(ctx context.Context, registration contract.RestaurantRegistration) error {
@@ -91,7 +99,7 @@ func (r *Registry) Register(ctx context.Context, registration contract.Restauran
 	if ports.Attempts != nil {
 		attempts = proxy
 	}
-	runtime, err := NewInMemory(Options{Now: r.options.Now, NewID: r.options.NewID, OrdersWarehouse: proxy, OrderAttemptReader: attempts, CatalogWarehouse: proxy, MenuWarehouse: proxy, RecommendationsWarehouse: proxy})
+	runtime, err := NewInMemory(Options{Now: r.options.Now, NewID: r.options.NewID, OrdersWarehouse: proxy, OrderAttemptReader: attempts, CatalogWarehouse: proxy, MenuWarehouse: proxy, RecommendationsWarehouse: proxy, Logger: r.log})
 	if err != nil {
 		return err
 	}
@@ -145,6 +153,7 @@ func (r *Registry) Resolve(ctx context.Context, scope contract.RequestScope) (*R
 	defer r.mu.RUnlock()
 	if closed, ok := r.closed[scope.TenantID]; ok {
 		if closed.registration.OrgID != scope.OrgID {
+			r.logTenantMismatch("resolve", closed.registration, scope.OrgID, scope.LifecycleVersion)
 			return nil, contract.RuntimeInfo{}, &contract.OperationError{Code: "Forbidden", Outcome: "unavailable"}
 		}
 		return nil, contract.RuntimeInfo{}, &contract.OperationError{Code: "ScopeDeleted", Outcome: "unavailable"}
@@ -154,6 +163,7 @@ func (r *Registry) Resolve(ctx context.Context, scope contract.RequestScope) (*R
 		return nil, contract.RuntimeInfo{}, &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
 	}
 	if entry.registration.OrgID != scope.OrgID || entry.registration.LifecycleVersion != scope.LifecycleVersion {
+		r.logTenantMismatch("resolve", entry.registration, scope.OrgID, scope.LifecycleVersion)
 		return nil, contract.RuntimeInfo{}, &contract.OperationError{Code: "Forbidden", Outcome: "unavailable"}
 	}
 	return entry.runtime, contract.RuntimeInfo{Epoch: r.options.Epoch, WarehouseEpoch: entry.warehouseEpoch}, nil
@@ -228,52 +238,53 @@ func (r *Registry) Status() contract.RuntimeStatus {
 }
 func (r *Registry) Reconcile(ctx context.Context, snapshot contract.RegistrySnapshot) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return r.reconcileFailed("context_done", snapshot, err)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ready = false
 	if !snapshot.Complete || !contract.ValidVersion(snapshot.Revision) || len(snapshot.Entries) > 10000 || len(snapshot.Tombstones) > 10000 {
-		return &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
+		return r.reconcileFailed("snapshot_invalid", snapshot, &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"})
 	}
 	if r.revision != "" {
 		old, err := strconv.ParseInt(r.revision, 10, 64)
 		if err != nil {
-			return err
+			return r.reconcileFailed("revision_invalid", snapshot, err)
 		}
 		next, err := strconv.ParseInt(snapshot.Revision, 10, 64)
 		if err != nil {
-			return err
+			return r.reconcileFailed("revision_invalid", snapshot, err)
 		}
 		if next < old {
-			return &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
+			return r.reconcileFailed("revision_rollback", snapshot, &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}, slog.String("local_revision", boundedLog(r.revision)))
 		}
 	}
 	entryIDs := make(map[string]bool)
 	for _, entry := range snapshot.Entries {
 		if entryIDs[entry.TenantID] {
-			return contract.ErrInvalidArgument
+			return r.reconcileFailed("invalid_entry", snapshot, contract.ErrInvalidArgument)
 		}
 		entryIDs[entry.TenantID] = true
 		if entry.Lifecycle != "registering" && entry.Lifecycle != "ready" && entry.Lifecycle != "deleting" && entry.Lifecycle != "deleted" {
-			return contract.ErrInvalidArgument
+			return r.reconcileFailed("invalid_entry", snapshot, contract.ErrInvalidArgument)
 		}
 	}
 	seen := make(map[string]contract.RegistryRestaurant)
 	tombstones := make(map[string]bool)
 	for _, entry := range snapshot.Tombstones {
 		if tombstones[entry.TenantID] {
-			return contract.ErrInvalidArgument
+			return r.reconcileFailed("invalid_entry", snapshot, contract.ErrInvalidArgument)
 		}
 		tombstones[entry.TenantID] = true
 	}
+	skipped := make(map[string]bool)
 	for _, entry := range append(append([]contract.RegistryRestaurant(nil), snapshot.Entries...), snapshot.Tombstones...) {
 		if !contract.ValidEntityID(entry.OrgID) || !contract.ValidEntityID(entry.TenantID) || !contract.ValidVersion(entry.LifecycleVersion) {
-			return contract.ErrInvalidArgument
+			return r.reconcileFailed("invalid_entry", snapshot, contract.ErrInvalidArgument)
 		}
 		if previous, ok := seen[entry.TenantID]; ok {
 			if previous.OrgID != entry.OrgID || previous.LifecycleVersion != entry.LifecycleVersion || (previous.Lifecycle != "deleting" && previous.Lifecycle != "deleted") {
-				return contract.ErrInvalidArgument
+				return r.reconcileFailed("invalid_entry", snapshot, contract.ErrInvalidArgument)
 			}
 			continue
 		}
@@ -284,25 +295,103 @@ func (r *Registry) Reconcile(ctx context.Context, snapshot contract.RegistrySnap
 			// process. It is not served until installed (Resolve answers
 			// RuntimeNotReady), and it must not close the whole process.
 			// A restaurant closed locally is different: it stays an error.
+			skipped[entry.TenantID] = true
+			r.logSkippedRegistering(snapshot, entry)
 			continue
 		}
+		notReady := &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
 		if entry.Lifecycle == "ready" || entry.Lifecycle == "registering" {
-			if !ok || local.registration.OrgID != entry.OrgID || local.registration.LifecycleVersion != entry.LifecycleVersion {
-				return &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
+			switch {
+			case !ok && entry.Lifecycle == "registering":
+				return r.reconcileFailed("registering_closed_locally", snapshot, notReady, tenantAttrs(entry)...)
+			case !ok:
+				return r.reconcileFailed("ready_not_installed", snapshot, notReady, tenantAttrs(entry)...)
+			case local.registration.OrgID != entry.OrgID || local.registration.LifecycleVersion != entry.LifecycleVersion:
+				r.logTenantMismatch("reconcile", local.registration, entry.OrgID, entry.LifecycleVersion)
+				return r.reconcileFailed("tenant_mismatch", snapshot, notReady, tenantAttrs(entry)...)
 			}
 		} else {
 			closed, ok := r.closed[entry.TenantID]
-			if !ok || closed.registration.OrgID != entry.OrgID || closed.registration.LifecycleVersion != entry.LifecycleVersion {
-				return &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
+			switch {
+			case !ok:
+				return r.reconcileFailed("tombstone_not_applied", snapshot, notReady, tenantAttrs(entry)...)
+			case closed.registration.OrgID != entry.OrgID || closed.registration.LifecycleVersion != entry.LifecycleVersion:
+				r.logTenantMismatch("reconcile", closed.registration, entry.OrgID, entry.LifecycleVersion)
+				return r.reconcileFailed("tenant_mismatch", snapshot, notReady, tenantAttrs(entry)...)
 			}
 		}
 	}
 	for tenant := range r.restaurants {
 		if _, ok := seen[tenant]; !ok {
-			return &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}
+			return r.reconcileFailed("local_missing_from_snapshot", snapshot, &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable"}, slog.String("tenant_id", tenant))
+		}
+	}
+	for tenant := range r.skipLogged {
+		if !skipped[tenant] {
+			delete(r.skipLogged, tenant)
 		}
 	}
 	r.revision = snapshot.Revision
 	r.ready = true
 	return nil
+}
+
+func tenantAttrs(entry contract.RegistryRestaurant) []slog.Attr {
+	return []slog.Attr{slog.String("tenant_id", entry.TenantID), slog.String("org_id", entry.OrgID), slog.String("lifecycle_version", boundedLog(entry.LifecycleVersion))}
+}
+
+// reconcileFailed records why a reconciliation did not make the registry ready
+// and returns err unchanged. Reasons are fixed words; the record carries the
+// error code, never its text.
+func (r *Registry) reconcileFailed(reason string, snapshot contract.RegistrySnapshot, err error, extra ...slog.Attr) error {
+	attrs := []slog.Attr{slog.String("event", EventReconcileFailed), slog.String("reason", reason), slog.String("error_code", errorCode(err)), slog.String("revision", boundedLog(snapshot.Revision))}
+	r.log.LogAttrs(context.Background(), slog.LevelError, EventReconcileFailed, append(attrs, extra...)...)
+	return err
+}
+
+// logSkippedRegistering notes, once per entry, that Auth lists a restaurant as
+// registering before its registration reached this process.
+func (r *Registry) logSkippedRegistering(snapshot contract.RegistrySnapshot, entry contract.RegistryRestaurant) {
+	key := entry.OrgID + "/" + entry.LifecycleVersion
+	if r.skipLogged[entry.TenantID] == key {
+		return
+	}
+	r.skipLogged[entry.TenantID] = key
+	attrs := append([]slog.Attr{slog.String("event", EventReconcileFailed), slog.String("reason", "registering_not_installed"), slog.String("revision", boundedLog(snapshot.Revision))}, tenantAttrs(entry)...)
+	r.log.LogAttrs(context.Background(), slog.LevelWarn, EventReconcileFailed, attrs...)
+}
+
+// logTenantMismatch records an organization or lifecycle version that differs
+// from the registration this process holds for the restaurant.
+func (r *Registry) logTenantMismatch(where string, registered contract.RestaurantRegistration, orgID, lifecycleVersion string) {
+	reason := "lifecycle_mismatch"
+	if registered.OrgID != orgID {
+		reason = "org_mismatch"
+	}
+	r.log.LogAttrs(context.Background(), slog.LevelWarn, EventRegistryTenantMismatch,
+		slog.String("event", EventRegistryTenantMismatch), slog.String("where", where), slog.String("reason", reason),
+		slog.String("tenant_id", registered.TenantID),
+		slog.String("registered_org_id", registered.OrgID), slog.String("presented_org_id", boundedLog(orgID)),
+		slog.String("registered_lifecycle_version", registered.LifecycleVersion), slog.String("presented_lifecycle_version", boundedLog(lifecycleVersion)))
+}
+
+// errorCode is the bounded code of err for log records.
+func errorCode(err error) string {
+	var operation *contract.OperationError
+	switch {
+	case errors.As(err, &operation):
+		return operation.Code
+	case errors.Is(err, contract.ErrInvalidArgument):
+		return "InvalidArgument"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "ContextDone"
+	}
+	return "Error"
+}
+
+func boundedLog(value string) string {
+	if len(value) > 64 {
+		return value[:64]
+	}
+	return value
 }
