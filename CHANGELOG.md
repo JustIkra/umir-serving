@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Recover a retained scoped confirmation after a verified unseen owner attempt by submitting the exact saved command once in the same epoch and unchanged scope/settings. Keep passive Resolve, pending-owner suppression, recorded-outcome replay and reset/indeterminate behavior. Bound redelivery to ten seconds and preserve proposal serialization.
+
 - Bound the test-only commit timeout probe's owner-entry wait and allow one second
   for actual HTTP dispatch. Keep the unknown outcome and single-attempt assertions.
 

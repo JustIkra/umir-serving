@@ -10,7 +10,10 @@ import (
 	"github.com/JustIkra/umir-serving/internal/domain"
 )
 
-const localCompletionBudget = 2 * time.Second
+const (
+	localCompletionBudget = 2 * time.Second
+	retryCommitBudget     = 10 * time.Second
+)
 
 func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
 	if request.CommandID == "" || request.ProposalID == "" {
@@ -50,7 +53,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 	}
 
 	if found && attempt.Context.Epoch != "" {
-		return s.resolveAttempt(ctx, request, attempt)
+		return s.resolveAttempt(ctx, request, attempt, true)
 	}
 	proposalForScope, scopeFound, scopeErr := s.store.Get(ctx, request.ProposalID)
 	if _, scoped := contract.RequestScopeFromContext(ctx); scoped && (scopeErr != nil || !scopeFound) {
@@ -192,7 +195,11 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 			return contract.ConfirmResult{}, contract.ErrInventoryUnavailable
 		}
 	}
-	commit := contract.CommitOrderRequest{CommandID: request.CommandID, ProposalID: request.ProposalID, AcceptedPositions: append([]contract.AcceptedPosition(nil), attempt.AcceptedPositions...)}
+	return s.commitSavedAttempt(ctx, attempt, capture)
+}
+
+func (s *OrdersService) commitSavedAttempt(ctx context.Context, attempt contract.ConfirmationAttempt, capture *capturedWarehouse) (contract.ConfirmResult, error) {
+	commit := contract.CommitOrderRequest{CommandID: attempt.CommandID, ProposalID: attempt.ProposalID, AcceptedPositions: append([]contract.AcceptedPosition(nil), attempt.AcceptedPositions...)}
 	result, err := s.warehouse.CommitAcceptedOrder(ctx, commit)
 	result.Context = capture.value
 	if err != nil {
@@ -347,10 +354,10 @@ func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contrac
 	if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 		return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 	}
-	return s.resolveAttempt(ctx, request, attempt)
+	return s.resolveAttempt(ctx, request, attempt, false)
 }
 
-func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.ConfirmOrderRequest, attempt contract.ConfirmationAttempt) (contract.ConfirmResult, error) {
+func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.ConfirmOrderRequest, attempt contract.ConfirmationAttempt, retry bool) (contract.ConfirmResult, error) {
 	if err := requireSavedEpoch(ctx, attempt.Context); err != nil {
 		return contract.ConfirmResult{}, err
 	}
@@ -372,9 +379,18 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 	if err != nil {
 		return contract.ConfirmResult{}, unknownLookupError(err)
 	}
+	if attempt.Context.Epoch != "" && capture.value.Epoch != "" && capture.value.Epoch != attempt.Context.Epoch {
+		return contract.ConfirmResult{}, &contract.OperationError{Code: "RuntimeReset", Outcome: "indeterminate"}
+	}
 	switch warehouseAttempt.State {
 	case contract.OrderAttemptUnseen:
 		if attempt.State == contract.OrderAttemptPending && attempt.Pending {
+			if retry && len(attempt.AcceptedPositions) > 0 && retryScopeMatches(ctx, attempt.Context, capture.value) {
+				ctx = contract.WithWarehouseBinding(ctx, attempt.Context, false)
+				bounded, cancel := context.WithTimeout(ctx, retryCommitBudget)
+				defer cancel()
+				return s.commitSavedAttempt(bounded, attempt, capture)
+			}
 			return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 		}
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
@@ -394,6 +410,15 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 	default:
 		return contract.ConfirmResult{}, unknownLookupError(fmt.Errorf("unknown order attempt state %q", warehouseAttempt.State))
 	}
+}
+
+func retryScopeMatches(ctx context.Context, saved, observed contract.WarehouseContext) bool {
+	scope, ok := contract.RequestScopeFromContext(ctx)
+	return ok && saved.Epoch != "" && observed.Epoch == saved.Epoch &&
+		observed.OrgID == saved.OrgID && observed.TenantID == saved.TenantID &&
+		observed.TimeZone == saved.TimeZone && observed.SettingsVersion == saved.SettingsVersion &&
+		scope.OrgID == saved.OrgID && scope.TenantID == saved.TenantID &&
+		scope.TimeZone == saved.TimeZone && scope.SettingsVersion == saved.SettingsVersion
 }
 
 func terminalAttempt(attempt contract.ConfirmationAttempt) (contract.ConfirmResult, error, bool) {
