@@ -449,9 +449,6 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 		if value.Code == "CommandIdentityConflict" { // a legacy Warehouse code; the public enum has CommandConflict
 			value.Code = "CommandConflict"
 		}
-		if value.Code == "InternalError" { // a legacy Warehouse code; the public enum has TechnicalError
-			value.Code = "TechnicalError"
-		}
 		value.Outcome = operation.Outcome
 		if operation.Message != "" {
 			value.Message = operation.Message

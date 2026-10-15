@@ -323,6 +323,9 @@ func (s *OrdersService) completeRejectedAttempt(ctx context.Context, attempt con
 	if value.Outcome != "not_committed" {
 		return unknownCompletionError(errors.New("warehouse rejection outcome is not terminal"))
 	}
+	if value.Code == legacyCommandIdentityConflictCode {
+		value.Code = "CommandConflict"
+	}
 	completionContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), localCompletionBudget)
 	defer cancel()
 	if err := s.attempts.CompleteAttempt(completionContext, attempt.CommandID, contract.ConfirmResult{}, &value, nil); err != nil {

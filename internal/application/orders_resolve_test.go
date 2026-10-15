@@ -131,3 +131,39 @@ func newOrdersServiceWithReader(t *testing.T, store application.ProposalStore, w
 	}
 	return service
 }
+
+// A non-scoped Warehouse may still answer a rejected attempt with the old
+// CommandIdentityConflict code; the stored attempt must carry the public code.
+func TestRejectedWarehouseAttemptWithLegacyConflictCodeIsStoredAsCommandConflict(t *testing.T) {
+	legacy := contract.OrderAttempt{State: contract.OrderAttemptRejected, Error: &contract.AttemptError{Code: "CommandIdentityConflict", Message: "conflict", Outcome: "not_committed"}}
+	for name, run := range map[string]func(*application.OrdersService) error{
+		"ResolveConfirmation": func(service *application.OrdersService) error {
+			_, err := service.ResolveConfirmation(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+			return err
+		},
+		"ConfirmOrder": func(service *application.OrdersService) error {
+			_, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := memory.NewProposalStore()
+			warehouse := newWarehouseFake()
+			reader := &attemptReaderFake{result: legacy}
+			service := newOrdersServiceWithReader(t, store, warehouse, reader)
+			createProposal(t, store, proposalFixture("proposal-1", 2))
+			if _, _, err := store.BeginAttempt(context.Background(), contract.ConfirmationAttempt{CommandID: "command-1", ProposalID: "proposal-1", Fingerprint: confirmFingerprint("proposal-1"), AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 2}}, Pending: true}); err != nil {
+				t.Fatal(err)
+			}
+			err := run(service)
+			var operation *contract.OperationError
+			if !errors.Is(err, contract.ErrCommandIdentityConflict) || !errors.As(err, &operation) || operation.Code != "CommandConflict" {
+				t.Fatalf("error = %#v, want CommandConflict", err)
+			}
+			stored, found, getErr := store.GetAttempt(context.Background(), "command-1")
+			if getErr != nil || !found || stored.State != contract.OrderAttemptRejected || stored.Error == nil || stored.Error.Code != "CommandConflict" {
+				t.Fatalf("stored attempt = (%+v,%v,%v), want Rejected/CommandConflict", stored, found, getErr)
+			}
+		})
+	}
+}
