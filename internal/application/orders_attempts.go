@@ -391,10 +391,16 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 	if attempt.Context.Epoch != "" && capture.value.Epoch != "" && capture.value.Epoch != attempt.Context.Epoch {
 		return contract.ConfirmResult{}, &contract.OperationError{Code: "RuntimeReset", Outcome: "indeterminate"}
 	}
+	// Redelivery needs provenance from the owner attempt read itself; the
+	// /commands lookup below may record its own observation.
+	attemptObservation := capture.value
 	switch warehouseAttempt.State {
 	case contract.OrderAttemptUnseen:
 		if attempt.State == contract.OrderAttemptPending && attempt.Pending {
-			if retry && len(attempt.AcceptedPositions) > 0 && retryScopeMatches(ctx, attempt.Context, capture.value) {
+			if result, handled, err := s.finishFromRecordedCommand(ctx, attempt, capture); handled {
+				return result, err
+			}
+			if retry && len(attempt.AcceptedPositions) > 0 && retryScopeMatches(ctx, attempt.Context, attemptObservation) {
 				ctx = contract.WithWarehouseBinding(ctx, attempt.Context, false)
 				bounded, cancel := context.WithTimeout(ctx, retryCommitBudget)
 				defer cancel()
@@ -404,6 +410,9 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 		}
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	case contract.OrderAttemptPending:
+		if result, handled, err := s.finishFromRecordedCommand(ctx, attempt, capture); handled {
+			return result, err
+		}
 		return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 	case contract.OrderAttemptCompleted:
 		if warehouseAttempt.Result == nil || warehouseAttempt.Result.Kind == contract.CommitPending {
@@ -419,6 +428,33 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 	default:
 		return contract.ConfirmResult{}, unknownLookupError(fmt.Errorf("unknown order attempt state %q", warehouseAttempt.State))
 	}
+}
+
+// finishFromRecordedCommand lets a retained attempt whose owner attempt is
+// Pending or Unseen look at /commands before it reports ConfirmationPending: the
+// owner may have recorded the order and lost the reply. handled is false only
+// when /commands has no record, so the caller keeps its own answer. It never
+// commits. A lookup failure is an unknown outcome and leaves the attempt as is.
+func (s *OrdersService) finishFromRecordedCommand(ctx context.Context, attempt contract.ConfirmationAttempt, capture *capturedWarehouse) (contract.ConfirmResult, bool, error) {
+	recorded, found, err := s.warehouse.FindRecordedCommand(ctx, attempt.CommandID)
+	if err != nil {
+		return contract.ConfirmResult{}, true, unknownLookupError(err)
+	}
+	if attempt.Context.Epoch != "" && capture.value.Epoch != "" && capture.value.Epoch != attempt.Context.Epoch {
+		return contract.ConfirmResult{}, true, &contract.OperationError{Code: "RuntimeReset", Outcome: "indeterminate"}
+	}
+	if !found {
+		return contract.ConfirmResult{}, false, nil
+	}
+	order, err := recordedOrder(recorded, attempt.CommandID, attempt.ProposalID, attempt.Fingerprint)
+	if err != nil {
+		if errors.Is(err, contract.ErrCommandIdentityConflict) {
+			return contract.ConfirmResult{}, true, s.finishKnownError(ctx, attempt, err)
+		}
+		return contract.ConfirmResult{}, true, unknownLookupError(err)
+	}
+	result, err := s.finishReadOrder(ctx, attempt, order, capture.value)
+	return result, true, err
 }
 
 func retryScopeMatches(ctx context.Context, saved, observed contract.WarehouseContext) bool {
