@@ -33,4 +33,9 @@ var (
 	ErrConfirmationPending     = errors.New("confirmation pending")
 	ErrDishNotFound            = errors.New("dish not found")
 	ErrProductNotFound         = errors.New("product not found")
+	// ErrLimitExceeded: a quota of the restaurant is used up (G1-5: active
+	// proposals). Nothing was done.
+	ErrLimitExceeded = errors.New("limit exceeded")
+	// ErrStorageUnavailable wraps a failure of the durable storage.
+	ErrStorageUnavailable = errors.New("storage unavailable")
 )

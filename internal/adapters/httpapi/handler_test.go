@@ -24,6 +24,8 @@ type runtimeStub struct {
 	definedDish   contract.DefineDishRequest
 	confirmResult contract.ConfirmResult
 	resolveErr    error
+	confirmErr    error
+	confirmCalls  int
 }
 
 func (r *runtimeStub) RegisterProduct(_ context.Context, _ contract.RegisterProductRequest) (contract.Product, error) {
@@ -43,7 +45,8 @@ func (r *runtimeStub) DefineDish(_ context.Context, request contract.DefineDishR
 }
 
 func (r *runtimeStub) ConfirmOrder(context.Context, contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
-	return r.confirmResult, nil
+	r.confirmCalls++
+	return r.confirmResult, r.confirmErr
 }
 
 func (r *runtimeStub) ResolveConfirmation(context.Context, contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
@@ -108,6 +111,53 @@ func TestHandlerInvalidArgumentOutcomeDependsOnOperation(t *testing.T) {
 	}
 	if runtime.registerCalls != 0 {
 		t.Fatalf("rejected requests called RegisterProduct %d times", runtime.registerCalls)
+	}
+}
+
+func TestHandlerLimitExceededIsConflictNotRateLimited(t *testing.T) {
+	runtime := &runtimeStub{confirmErr: contract.ErrLimitExceeded}
+	handler, err := NewHandler(runtime, Options{RequestTimeout: time.Second, MaxRequestBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/order-confirmations", strings.NewReader(`{"commandID":"c1","proposalID":"p1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"code":"LimitExceeded"`) || !strings.Contains(response.Body.String(), `"outcome":"not_committed"`) {
+		t.Fatalf("response = %d %s, want 409 LimitExceeded/not_committed", response.Code, response.Body.String())
+	}
+}
+
+func TestPrepareOrderRejectsMoreThan200PositionsBeforeRuntime(t *testing.T) {
+	runtime := &runtimeStub{}
+	handler, err := NewHandler(runtime, Options{RequestTimeout: time.Second, MaxRequestBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := `{"dishID":"dish-1","portions":"1"}`
+	positions := strings.TrimSuffix(strings.Repeat(position+",", 201), ",")
+	request := httptest.NewRequest(http.MethodPost, "/order-proposals", strings.NewReader(`{"positions":[`+positions+`]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"outcome":"not_committed"`) {
+		t.Fatalf("response = %d %s, want 400 not_committed", response.Code, response.Body.String())
+	}
+}
+
+func TestConfirmRejectsIDsOver256CodePointsBeforeRuntime(t *testing.T) {
+	runtime := &runtimeStub{}
+	handler, err := NewHandler(runtime, Options{RequestTimeout: time.Second, MaxRequestBytes: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/order-confirmations", strings.NewReader(`{"commandID":"`+strings.Repeat("я", 257)+`","proposalID":"p1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || runtime.confirmCalls != 0 {
+		t.Fatalf("response = %d, runtime calls = %d, want 400 and no call", response.Code, runtime.confirmCalls)
 	}
 }
 

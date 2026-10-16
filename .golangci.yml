@@ -1,6 +1,7 @@
 version: "2"
 run:
   tests: true
+  build-tags: [integration]
   relative-path-mode: cfg
 linters:
   default: none
@@ -40,7 +41,7 @@ linters:
               desc: "Service code must not import the factory."
         fixture-imports:
           list-mode: lax
-          files: ["$all", "!$test", "!**/tests/fixtures/server/main.go", "!**/tests/fixtures/control/main.go", "!**/tests/fixtures/catalog/build/main.go"]
+          files: ["$all", "!$test", "!**/tests/fixtures/server/main.go", "!**/tests/fixtures/control/main.go", "!**/tests/fixtures/catalog/build/main.go", "!**/tests/pgtest/**", "!**/tests/storecontract/**", "!**/tests/amqptest/**"]
           deny:
             - pkg: "github.com/JustIkra/umir-serving/tests/"
               desc: "Production must not import test support."

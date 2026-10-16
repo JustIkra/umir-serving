@@ -12,7 +12,17 @@ import (
 	"github.com/JustIkra/umir-serving/internal/application"
 )
 
-func TestWaitingForProposalLockHonorsContext(t *testing.T) {
+type leaseFailureStore struct {
+	application.ProposalStore
+	application.ConfirmationAttemptStore
+	err error
+}
+
+func (s leaseFailureStore) AcquireLease(context.Context, string, string, time.Duration) (application.Lease, bool, error) {
+	return application.Lease{}, false, s.err
+}
+
+func TestWaitingForProposalLeaseHonorsContext(t *testing.T) {
 	waiters := map[string]func(context.Context, *application.OrdersService) error{
 		"confirm": func(ctx context.Context, service *application.OrdersService) error {
 			_, err := service.ConfirmOrder(ctx, contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
@@ -100,7 +110,7 @@ func TestWaitingForProposalLockHonorsContext(t *testing.T) {
 	}
 }
 
-func TestProposalLockIsReusableAfterCancelledWaiter(t *testing.T) {
+func TestProposalLeaseIsReusableAfterCancelledWaiter(t *testing.T) {
 	store := memory.NewProposalStore()
 	warehouse := newWarehouseFake()
 	service := newOrdersService(t, store, warehouse)
@@ -136,8 +146,7 @@ func TestProposalLockIsReusableAfterCancelledWaiter(t *testing.T) {
 	}
 	close(release)
 	<-firstDone
-	// The owner released the lock and the cancelled waiter left nothing
-	// behind: the same command is served again without blocking.
+	// The owner released its lease and the cancelled waiter left no lease behind.
 	warehouse.commitHook = nil
 	retryDone := make(chan error, 1)
 	go func() {
@@ -148,5 +157,66 @@ func TestProposalLockIsReusableAfterCancelledWaiter(t *testing.T) {
 	case <-retryDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("ConfirmOrder() blocked after the cancelled waiter left")
+	}
+}
+
+func TestSeparateOrderServicesShareProposalLease(t *testing.T) {
+	store := memory.NewProposalStore()
+	warehouse := newWarehouseFake()
+	createProposal(t, store, proposalFixture("proposal-1", 2))
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	warehouse.commitHook = func(contract.CommitOrderRequest) (contract.CommitResult, error) {
+		close(entered)
+		<-release
+		return contract.CommitResult{}, errors.New("response lost")
+	}
+	first, err := application.NewOrdersServiceWithOptions(store, warehouse, time.Now, func() string { return "replacement" }, application.OrdersServiceOptions{LeaseHolder: "instance-a", LeaseTTL: time.Second, LeaseWait: 20 * time.Millisecond, LeaseClock: time.Now, Wait: testWait})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := application.NewOrdersServiceWithOptions(store, warehouse, time.Now, func() string { return "replacement" }, application.OrdersServiceOptions{LeaseHolder: "instance-b", LeaseTTL: time.Second, LeaseWait: 20 * time.Millisecond, LeaseClock: time.Now, Wait: testWait})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := first.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+		firstDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first confirmation did not reach warehouse")
+	}
+	result, err := second.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-2", ProposalID: "proposal-1"})
+	if err != nil || result.Kind != contract.ConfirmationPending {
+		t.Fatalf("second confirmation = (%+v, %v), want ConfirmationPending", result, err)
+	}
+	close(release)
+	if err := <-firstDone; err == nil {
+		t.Fatal("first confirmation unexpectedly succeeded")
+	}
+	if _, calls := warehouse.commits(); calls != 1 {
+		t.Fatalf("warehouse commits = %d, want 1", calls)
+	}
+}
+
+func TestLeaseStorageFailureIsNotCommittedBeforeWarehouse(t *testing.T) {
+	base := memory.NewProposalStore()
+	createProposal(t, base, proposalFixture("proposal-1", 2))
+	warehouse := newWarehouseFake()
+	store := leaseFailureStore{ProposalStore: base, ConfirmationAttemptStore: base, err: contract.ErrStorageUnavailable}
+	service, err := application.NewOrdersService(store, warehouse, time.Now, func() string { return "replacement" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	var operation *contract.OperationError
+	if !errors.As(err, &operation) || operation.Code != "ServiceUnavailable" || operation.Outcome != "not_committed" {
+		t.Fatalf("ConfirmOrder() error = %v, want ServiceUnavailable/not_committed", err)
+	}
+	if _, calls := warehouse.commits(); calls != 0 {
+		t.Fatalf("warehouse commits = %d, want 0", calls)
 	}
 }

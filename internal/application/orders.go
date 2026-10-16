@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/JustIkra/umir-serving/contract"
@@ -23,28 +22,63 @@ type OrdersService struct {
 	now           func() time.Time
 	newID         func() string
 	log           *slog.Logger
-	locksMu       sync.Mutex
-	locks         map[string]*proposalLock
-}
-
-type proposalLock struct {
-	sem  chan struct{}
-	refs int
+	leaseHolder   string
+	leaseTTL      time.Duration
+	leaseWait     time.Duration
+	leaseClock    func() time.Time
+	maxPositions  int
+	wait          func(context.Context, time.Duration) error
 }
 
 func NewOrdersService(store ProposalStore, warehouse contract.OrdersWarehouse, now func() time.Time, newID func() string, readers ...contract.OrderAttemptReader) (*OrdersService, error) {
+	return NewOrdersServiceWithOptions(store, warehouse, now, newID, OrdersServiceOptions{}, readers...)
+}
+
+type OrdersServiceOptions struct {
+	LeaseHolder  string
+	LeaseTTL     time.Duration
+	LeaseWait    time.Duration
+	LeaseClock   func() time.Time
+	MaxPositions int
+	Wait         func(context.Context, time.Duration) error
+}
+
+func NewOrdersServiceWithOptions(store ProposalStore, warehouse contract.OrdersWarehouse, now func() time.Time, newID func() string, options OrdersServiceOptions, readers ...contract.OrderAttemptReader) (*OrdersService, error) {
 	attempts, ok := store.(ConfirmationAttemptStore)
 	if store == nil || !ok || warehouse == nil || now == nil || newID == nil {
 		return nil, contract.ErrInvalidArgument
 	}
+	if options.LeaseHolder == "" {
+		options.LeaseHolder = "serving"
+	}
+	if options.LeaseTTL == 0 {
+		options.LeaseTTL = 30 * time.Second
+	}
+	if options.LeaseWait == 0 {
+		options.LeaseWait = 1500 * time.Millisecond
+	}
+	if options.MaxPositions == 0 {
+		options.MaxPositions = contract.MaxOrderPositions
+	}
+	if options.Wait != nil && options.LeaseClock == nil {
+		options.LeaseClock = now
+	}
+	if options.LeaseTTL < time.Second || options.LeaseWait < 0 || options.MaxPositions < 1 {
+		return nil, contract.ErrInvalidArgument
+	}
 	service := &OrdersService{
-		store:     store,
-		attempts:  attempts,
-		warehouse: warehouse,
-		now:       now,
-		newID:     newID,
-		log:       slog.New(slog.DiscardHandler),
-		locks:     make(map[string]*proposalLock),
+		store:        store,
+		attempts:     attempts,
+		warehouse:    warehouse,
+		now:          now,
+		newID:        newID,
+		log:          slog.New(slog.DiscardHandler),
+		leaseHolder:  options.LeaseHolder,
+		leaseTTL:     options.LeaseTTL,
+		leaseWait:    options.LeaseWait,
+		leaseClock:   options.LeaseClock,
+		maxPositions: options.MaxPositions,
+		wait:         options.Wait,
 	}
 	if len(readers) > 1 {
 		return nil, contract.ErrInvalidArgument
@@ -56,6 +90,9 @@ func NewOrdersService(store ProposalStore, warehouse contract.OrdersWarehouse, n
 }
 
 func (s *OrdersService) PrepareOrder(ctx context.Context, request contract.PrepareOrderRequest) (contract.OrderProposal, error) {
+	if len(request.Positions) > s.maxPositions {
+		return contract.OrderProposal{}, contract.ErrInvalidArgument
+	}
 	positions := make([]contract.Position, len(request.Positions))
 	for i, position := range request.Positions {
 		if position.DishID == "" || position.Portions <= 0 {
@@ -63,14 +100,14 @@ func (s *OrdersService) PrepareOrder(ctx context.Context, request contract.Prepa
 		}
 		positions[i] = contract.Position{LineNo: i + 1, DishID: position.DishID, Portions: position.Portions}
 	}
+	proposalID := s.newID()
+	if !contract.ValidClientID(proposalID) {
+		return contract.OrderProposal{}, contract.ErrInvalidArgument
+	}
 	ctx, capture := captureWarehouse(ctx)
 	evaluation, err := s.warehouse.EvaluateOrder(ctx, contract.EvaluateOrderRequest{Positions: positions})
 	if err != nil {
 		return contract.OrderProposal{}, err
-	}
-	proposalID := s.newID()
-	if proposalID == "" {
-		return contract.OrderProposal{}, contract.ErrInvalidArgument
 	}
 	proposal := domain.OrderProposal{
 		Context:            domainContext(capture.value),
@@ -82,6 +119,9 @@ func (s *OrdersService) PrepareOrder(ctx context.Context, request contract.Prepa
 		Changes:            toDomainChanges(evaluation.Changes),
 	}
 	if err := s.store.Create(ctx, proposal); err != nil {
+		if errors.Is(err, contract.ErrStorageUnavailable) {
+			return contract.OrderProposal{}, storageUnavailable(err, "not_committed")
+		}
 		return contract.OrderProposal{}, err
 	}
 	return toContractProposal(proposal), nil
@@ -99,38 +139,6 @@ func definiteCommitRejection(err error) bool {
 	return errors.Is(err, contract.ErrInventoryUnavailable) ||
 		errors.Is(err, contract.ErrInvalidArgument) ||
 		errors.Is(err, contract.ErrCommandIdentityConflict)
-}
-
-// lockProposal serializes work on one proposal. The wait ends with the context
-// error when ctx is done first, before the caller touches any store or
-// Warehouse; the error is returned as is and proves nothing about a commit.
-func (s *OrdersService) lockProposal(ctx context.Context, proposalID string) (func(), error) {
-	s.locksMu.Lock()
-	lock := s.locks[proposalID]
-	if lock == nil {
-		lock = &proposalLock{sem: make(chan struct{}, 1)}
-		s.locks[proposalID] = lock
-	}
-	lock.refs++
-	s.locksMu.Unlock()
-	release := func() {
-		s.locksMu.Lock()
-		lock.refs--
-		if lock.refs == 0 {
-			delete(s.locks, proposalID)
-		}
-		s.locksMu.Unlock()
-	}
-	select {
-	case lock.sem <- struct{}{}:
-	case <-ctx.Done():
-		release()
-		return nil, ctx.Err()
-	}
-	return func() {
-		<-lock.sem
-		release()
-	}, nil
 }
 
 func confirmOrderFingerprint(proposalID string) (string, error) {

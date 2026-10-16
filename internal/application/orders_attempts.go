@@ -23,14 +23,18 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 }
 
 func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request contract.ConfirmOrderRequest, trace *confirmTrace) (contract.ConfirmResult, error) {
-	if request.CommandID == "" || request.ProposalID == "" {
+	if !contract.ValidClientID(request.CommandID) || !contract.ValidClientID(request.ProposalID) {
 		return contract.ConfirmResult{}, contract.ErrInvalidArgument
 	}
-	unlock, err := s.lockProposal(ctx, request.ProposalID)
+	leaseContext, release, acquired, err := s.acquireProposalLease(ctx, request.ProposalID, "not_committed")
 	if err != nil {
 		return contract.ConfirmResult{}, err
 	}
-	defer unlock()
+	if !acquired {
+		return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+	}
+	ctx = leaseContext
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return contract.ConfirmResult{}, err
 	}
@@ -41,7 +45,7 @@ func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request c
 
 	attempt, found, err := s.attempts.GetAttempt(ctx, request.CommandID)
 	if err != nil {
-		return contract.ConfirmResult{}, err
+		return contract.ConfirmResult{}, unknownLookupError(err)
 	}
 	if found {
 		trace.observeAttempt(attempt)
@@ -70,6 +74,9 @@ func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request c
 	proposalForScope, scopeFound, scopeErr := s.store.Get(ctx, request.ProposalID)
 	if _, scoped := contract.RequestScopeFromContext(ctx); scoped && (scopeErr != nil || !scopeFound) {
 		if scopeErr != nil {
+			if errors.Is(scopeErr, contract.ErrStorageUnavailable) {
+				return contract.ConfirmResult{}, storageUnavailable(scopeErr, "not_committed")
+			}
 			return contract.ConfirmResult{}, unknownLookupError(scopeErr)
 		}
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
@@ -138,7 +145,7 @@ func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request c
 	}
 	proposalRecord, proposalFound, err := s.store.Get(ctx, request.ProposalID)
 	if err != nil {
-		return contract.ConfirmResult{}, err
+		return contract.ConfirmResult{}, preCommitStorageError(err)
 	}
 	accepted := []contract.AcceptedPosition(nil)
 	if proposalFound {
@@ -183,7 +190,7 @@ func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request c
 	trace.reserved = true
 	attempt, _, err = s.attempts.GetAttempt(ctx, request.CommandID)
 	if err != nil {
-		return contract.ConfirmResult{}, err
+		return contract.ConfirmResult{}, preCommitStorageError(err)
 	}
 	if s.attemptReader != nil {
 		warehouseAttempt, lookupErr := s.attemptReader.FindOrderAttempt(ctx, request.CommandID, request.ProposalID)
@@ -356,17 +363,21 @@ func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contrac
 }
 
 func (s *OrdersService) resolveConfirmation(ctx context.Context, request contract.ConfirmOrderRequest, trace *confirmTrace) (contract.ConfirmResult, error) {
-	if request.CommandID == "" || request.ProposalID == "" {
+	if !contract.ValidClientID(request.CommandID) || !contract.ValidClientID(request.ProposalID) {
 		return contract.ConfirmResult{}, contract.ErrInvalidArgument
 	}
 	if s.attempts == nil || s.attemptReader == nil {
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	}
-	unlock, err := s.lockProposal(ctx, request.ProposalID)
+	leaseContext, release, acquired, err := s.acquireProposalLease(ctx, request.ProposalID, "unavailable")
 	if err != nil {
 		return contract.ConfirmResult{}, err
 	}
-	defer unlock()
+	if !acquired {
+		return contract.ConfirmResult{Kind: contract.ConfirmationPending}, nil
+	}
+	ctx = leaseContext
+	defer release()
 	fingerprint, err := confirmOrderFingerprint(request.ProposalID)
 	if err != nil {
 		return contract.ConfirmResult{}, err
@@ -384,6 +395,57 @@ func (s *OrdersService) resolveConfirmation(ctx context.Context, request contrac
 	}
 	trace.markRetained(attempt)
 	return s.resolveAttempt(ctx, request, attempt, false)
+}
+
+func (s *OrdersService) acquireProposalLease(ctx context.Context, proposalID, outcome string) (context.Context, func(), bool, error) {
+	var deadline time.Time
+	if s.wait != nil {
+		deadline = s.leaseClock().Add(s.leaseWait)
+	}
+	for {
+		lease, acquired, err := s.attempts.AcquireLease(ctx, proposalID, s.leaseHolder, s.leaseTTL)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return ctx, nil, false, err
+			}
+			return ctx, nil, false, storageUnavailable(err, outcome)
+		}
+		if acquired {
+			leased := WithLease(ctx, lease)
+			release := func() {
+				releaseContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), localCompletionBudget)
+				defer cancel()
+				if err := s.attempts.ReleaseLease(releaseContext, lease); err != nil {
+					s.log.Warn("proposal lease release failed", "event", "proposal.lease_release_failed", "proposal_id", proposalID, "error_code", storageErrorCode(err))
+				}
+			}
+			return leased, release, true, nil
+		}
+		if s.wait == nil {
+			return ctx, nil, false, nil
+		}
+		remaining := deadline.Sub(s.leaseClock())
+		if remaining <= 0 {
+			return ctx, nil, false, nil
+		}
+		if remaining > 25*time.Millisecond {
+			remaining = 25 * time.Millisecond
+		}
+		if err := s.wait(ctx, remaining); err != nil {
+			return ctx, nil, false, err
+		}
+	}
+}
+
+func storageErrorCode(err error) string {
+	if errors.Is(err, contract.ErrStorageUnavailable) {
+		return "ServiceUnavailable"
+	}
+	return "TechnicalError"
+}
+
+func storageUnavailable(err error, outcome string) error {
+	return &contract.OperationError{Code: "ServiceUnavailable", Message: "durable storage is unavailable", Outcome: outcome, Cause: fmt.Errorf("%w: %w", contract.ErrStorageUnavailable, err)}
 }
 
 func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.ConfirmOrderRequest, attempt contract.ConfirmationAttempt, retry bool) (contract.ConfirmResult, error) {
@@ -565,10 +627,16 @@ func proposalNotFoundUnknown() error {
 }
 
 func unknownCompletionError(err error) error {
+	if errors.Is(err, contract.ErrStorageUnavailable) {
+		return storageUnavailable(err, "unknown")
+	}
 	return &contract.OperationError{Code: "InventoryUnavailable", Message: "warehouse outcome is known but local completion is pending", Outcome: "unknown", Cause: err}
 }
 
 func unknownLookupError(err error) error {
+	if errors.Is(err, contract.ErrStorageUnavailable) {
+		return storageUnavailable(err, "unknown")
+	}
 	var operation *contract.OperationError
 	if errors.As(err, &operation) {
 		value := *operation
@@ -582,6 +650,8 @@ func unknownLookupError(err error) error {
 
 func mapAttemptStoreError(err error) error {
 	switch {
+	case errors.Is(err, contract.ErrStorageUnavailable):
+		return storageUnavailable(err, "not_committed")
 	case errors.Is(err, contract.ErrCommandIdentityConflict):
 		return contract.ErrCommandIdentityConflict
 	case errors.Is(err, contract.ErrConfirmationPending):
@@ -591,6 +661,13 @@ func mapAttemptStoreError(err error) error {
 	default:
 		return err
 	}
+}
+
+func preCommitStorageError(err error) error {
+	if errors.Is(err, contract.ErrStorageUnavailable) {
+		return storageUnavailable(err, "not_committed")
+	}
+	return err
 }
 
 func domainRequestedFromContractAccepted(values []contract.AcceptedPosition) []domain.Position {

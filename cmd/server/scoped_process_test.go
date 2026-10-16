@@ -71,7 +71,7 @@ func TestS4ProcessFIN1PublicBoundaries(t *testing.T) {
 		switch r.URL.Path {
 		case "/internal/auth/v1/jwks":
 			s4JSON(t, w, map[string]any{"keys": []any{map[string]any{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "kid": "s4-key", "x": base64.RawURLEncoding.EncodeToString(public)}}})
-		case "/internal/auth/v1/registry":
+		case "/internal/auth/v1/registry", "/internal/auth/v1/registry/" + s4Tenant:
 			if unavailable {
 				w.WriteHeader(503)
 				return
@@ -80,7 +80,13 @@ func TestS4ProcessFIN1PublicBoundaries(t *testing.T) {
 			if servingEpoch != "" {
 				services = append(services, map[string]any{"restaurantID": s4Tenant, "service": "serving", "epoch": servingEpoch, "state": "ready", "lifecycleVersion": "1"})
 			}
-			s4JSON(t, w, map[string]any{"registryRevision": "1", "complete": true, "entries": []any{map[string]any{"restaurant": map[string]any{"restaurantID": s4Tenant, "orgID": s4Org, "name": "Fixture", "lifecycle": "ready", "lifecycleVersion": "1"}, "settings": map[string]any{"timeZone": "Europe/Moscow", "settingsVersion": "1"}, "services": services}}, "tombstones": []any{}})
+			entry := map[string]any{"restaurant": map[string]any{"restaurantID": s4Tenant, "orgID": s4Org, "name": "Fixture", "lifecycle": "ready", "lifecycleVersion": "1"}, "settings": map[string]any{"timeZone": "Europe/Moscow", "settingsVersion": "1"}, "services": services}
+			if r.URL.Path == "/internal/auth/v1/registry/"+s4Tenant {
+				w.Header().Set("ETag", `"1"`)
+				s4JSON(t, w, map[string]any{"registryRevision": "1", "state": "live", "entry": entry})
+			} else {
+				s4JSON(t, w, map[string]any{"registryRevision": "1", "complete": true, "entries": []any{entry}, "tombstones": []any{}})
+			}
 		default:
 			t.Errorf("unexpected Auth path %s", r.URL.Path)
 			w.WriteHeader(404)

@@ -1,6 +1,9 @@
 package contract
 
-import "time"
+import (
+	"time"
+	"unicode/utf8"
+)
 
 type Position struct {
 	LineNo   int
@@ -353,4 +356,21 @@ type DishCatalog struct {
 	EvaluatedAt  time.Time
 	StateVersion int64
 	Items        []Dish
+}
+
+// MaxClientIDLength is the longest command or proposal identifier in code
+// points (C43).
+const MaxClientIDLength = 256
+
+const MaxActiveProposals = 2000
+
+const MaxOrderPositions = 200
+
+// ValidClientID reports whether value is a usable command or proposal
+// identifier: valid UTF-8 of 1 to 256 code points.
+func ValidClientID(value string) bool {
+	if value == "" || !utf8.ValidString(value) {
+		return false
+	}
+	return utf8.RuneCountInString(value) <= MaxClientIDLength
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -134,6 +135,35 @@ func newWarehouseFake() *warehouseFake {
 	return &warehouseFake{
 		recorded:         make(map[string]contract.CommandRecord),
 		ordersByProposal: make(map[string]contract.Order),
+	}
+}
+
+func TestPrepareOrderRejectsPositionLimitBeforeWarehouse(t *testing.T) {
+	warehouse := newWarehouseFake()
+	service := newOrdersService(t, memory.NewProposalStore(), warehouse)
+	positions := make([]contract.Position, 201)
+	for index := range positions {
+		positions[index] = contract.Position{DishID: "dish-1", Portions: 1}
+	}
+	if _, err := service.PrepareOrder(context.Background(), contract.PrepareOrderRequest{Positions: positions}); !errors.Is(err, contract.ErrInvalidArgument) {
+		t.Fatalf("PrepareOrder() error = %v, want invalid argument", err)
+	}
+	if warehouse.evaluateCalls != 0 {
+		t.Fatalf("warehouse evaluations = %d, want 0", warehouse.evaluateCalls)
+	}
+}
+
+func TestPrepareOrderRejectsGeneratedProposalIDOverLimitBeforeWarehouse(t *testing.T) {
+	warehouse := newWarehouseFake()
+	service, err := application.NewOrdersService(memory.NewProposalStore(), warehouse, time.Now, func() string { return strings.Repeat("p", contract.MaxClientIDLength+1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.PrepareOrder(context.Background(), contract.PrepareOrderRequest{Positions: []contract.Position{{DishID: "dish-1", Portions: 1}}}); !errors.Is(err, contract.ErrInvalidArgument) {
+		t.Fatalf("PrepareOrder() error = %v, want invalid argument", err)
+	}
+	if warehouse.evaluateCalls != 0 {
+		t.Fatalf("warehouse evaluations = %d, want 0", warehouse.evaluateCalls)
 	}
 }
 
@@ -495,6 +525,40 @@ func TestRecordedWarehouseIdentityCannotBePoisonedByFreshServingBinding(t *testi
 	if commitCalls != 0 {
 		t.Fatalf("recorded replay called commit %d times", commitCalls)
 	}
+}
+
+func TestInitialAttemptLookupFailurePreservesUnknownOutcome(t *testing.T) {
+	base := memory.NewProposalStore()
+	createProposal(t, base, proposalFixture("proposal-1", 1))
+	if _, _, err := base.BeginAttempt(context.Background(), contract.ConfirmationAttempt{
+		CommandID: "command-1", ProposalID: "proposal-1", Fingerprint: confirmFingerprint("proposal-1"),
+		AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}, Pending: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
+	store := &attemptLookupFailureStore{ProposalStore: base, err: contract.ErrStorageUnavailable}
+	service := newOrdersService(t, store, warehouse)
+
+	_, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	var operation *contract.OperationError
+	if !errors.As(err, &operation) || operation.Code != "ServiceUnavailable" || operation.Outcome != "unknown" {
+		t.Fatalf("ConfirmOrder() error = %#v, want ServiceUnavailable/unknown", err)
+	}
+	if _, commits := warehouse.commits(); commits != 0 {
+		t.Fatalf("Warehouse commit calls = %d, want no new commit after the uncertain lookup", commits)
+	}
+}
+
+type attemptLookupFailureStore struct {
+	*memory.ProposalStore
+	err error
+}
+
+func (s *attemptLookupFailureStore) GetAttempt(context.Context, string) (contract.ConfirmationAttempt, bool, error) {
+	return contract.ConfirmationAttempt{}, false, s.err
 }
 
 func TestForeignWarehouseIdentityRejectsExistingPendingAttemptAndReleasesProposal(t *testing.T) {
@@ -1273,13 +1337,24 @@ func TestConfirmCommandFingerprintMatchesWarehouseConvention(t *testing.T) {
 func newOrdersService(t *testing.T, store application.ProposalStore, warehouse *warehouseFake) *application.OrdersService {
 	t.Helper()
 	ids := testsupport.NewIDs("generated-proposal-")
-	service, err := application.NewOrdersService(store, warehouse, func() time.Time {
+	service, err := application.NewOrdersServiceWithOptions(store, warehouse, func() time.Time {
 		return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow)
-	}, ids.Next)
+	}, ids.Next, application.OrdersServiceOptions{LeaseClock: time.Now, Wait: testWait})
 	if err != nil {
 		t.Fatalf("NewOrdersService() error = %v", err)
 	}
 	return service
+}
+
+func testWait(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func proposalFixture(proposalID string, portions int64) domain.OrderProposal {

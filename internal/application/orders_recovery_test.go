@@ -41,7 +41,7 @@ func retainedConfirmation(t *testing.T) (context.Context, *application.OrdersSer
 	fake.evaluation = contract.OrderEvaluation{EvaluatedAt: now, StateVersion: 1, RequestedPositions: []contract.Position{{LineNo: 1, DishID: "dish-1", Portions: 2}}, AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "dish-1", Portions: 2}}}
 	observation := contract.WarehouseContext{OrgID: "22222222-2222-4222-8222-222222222222", TenantID: "33333333-3333-4333-8333-333333333333", Epoch: "44444444-4444-4444-8444-444444444444", TimeZone: "Europe/Moscow", SettingsVersion: "1", EvaluatedAt: now, StateVersion: 1}
 	warehouse := &recoveryWarehouse{s3ObservedWarehouse: &s3ObservedWarehouse{warehouseFake: fake, context: observation}, attempt: contract.OrderAttempt{State: contract.OrderAttemptUnseen}, observe: true}
-	service, err := application.NewOrdersService(store, warehouse, func() time.Time { return now }, func() string { return "proposal-1" }, warehouse)
+	service, err := application.NewOrdersServiceWithOptions(store, warehouse, func() time.Time { return now }, func() string { return "proposal-1" }, application.OrdersServiceOptions{LeaseClock: time.Now, Wait: testWait}, warehouse)
 	if err != nil {
 		t.Fatal(err)
 	}
