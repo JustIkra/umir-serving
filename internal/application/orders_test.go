@@ -1337,13 +1337,24 @@ func TestConfirmCommandFingerprintMatchesWarehouseConvention(t *testing.T) {
 func newOrdersService(t *testing.T, store application.ProposalStore, warehouse *warehouseFake) *application.OrdersService {
 	t.Helper()
 	ids := testsupport.NewIDs("generated-proposal-")
-	service, err := application.NewOrdersService(store, warehouse, func() time.Time {
+	service, err := application.NewOrdersServiceWithOptions(store, warehouse, func() time.Time {
 		return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow)
-	}, ids.Next)
+	}, ids.Next, application.OrdersServiceOptions{LeaseClock: time.Now, Wait: testWait})
 	if err != nil {
 		t.Fatalf("NewOrdersService() error = %v", err)
 	}
 	return service
+}
+
+func testWait(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func proposalFixture(proposalID string, portions int64) domain.OrderProposal {

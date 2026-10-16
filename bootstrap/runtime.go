@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/JustIkra/umir-serving/contract"
 	"github.com/JustIkra/umir-serving/internal/adapters/memory"
@@ -29,7 +30,7 @@ func NewInMemory(options Options) (*Runtime, error) {
 	}
 
 	store := memory.NewProposalStore()
-	orders, err := application.NewOrdersService(store, options.OrdersWarehouse, options.Now, options.NewID, options.OrderAttemptReader)
+	orders, err := application.NewOrdersServiceWithOptions(store, options.OrdersWarehouse, options.Now, options.NewID, application.OrdersServiceOptions{LeaseClock: time.Now, Wait: waitContext}, options.OrderAttemptReader)
 	if err != nil {
 		return nil, err
 	}
@@ -41,6 +42,17 @@ func NewInMemory(options Options) (*Runtime, error) {
 	}
 	stop, cancel := context.WithCancel(context.Background())
 	return &Runtime{orders: orders, menu: menu, recommendations: recommendations, stop: stop, cancel: cancel}, nil
+}
+
+func waitContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (r *Runtime) PrepareOrder(ctx context.Context, request contract.PrepareOrderRequest) (contract.OrderProposal, error) {

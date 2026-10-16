@@ -398,10 +398,10 @@ func (s *OrdersService) resolveConfirmation(ctx context.Context, request contrac
 }
 
 func (s *OrdersService) acquireProposalLease(ctx context.Context, proposalID, outcome string) (context.Context, func(), bool, error) {
-	deadline := time.NewTimer(s.leaseWait)
-	defer deadline.Stop()
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
+	var deadline time.Time
+	if s.wait != nil {
+		deadline = s.leaseClock().Add(s.leaseWait)
+	}
 	for {
 		lease, acquired, err := s.attempts.AcquireLease(ctx, proposalID, s.leaseHolder, s.leaseTTL)
 		if err != nil {
@@ -415,18 +415,33 @@ func (s *OrdersService) acquireProposalLease(ctx context.Context, proposalID, ou
 			release := func() {
 				releaseContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), localCompletionBudget)
 				defer cancel()
-				_ = s.attempts.ReleaseLease(releaseContext, lease)
+				if err := s.attempts.ReleaseLease(releaseContext, lease); err != nil {
+					s.log.Warn("proposal lease release failed", "event", "proposal.lease_release_failed", "proposal_id", proposalID, "error_code", storageErrorCode(err))
+				}
 			}
 			return leased, release, true, nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx, nil, false, ctx.Err()
-		case <-deadline.C:
+		if s.wait == nil {
 			return ctx, nil, false, nil
-		case <-ticker.C:
+		}
+		remaining := deadline.Sub(s.leaseClock())
+		if remaining <= 0 {
+			return ctx, nil, false, nil
+		}
+		if remaining > 25*time.Millisecond {
+			remaining = 25 * time.Millisecond
+		}
+		if err := s.wait(ctx, remaining); err != nil {
+			return ctx, nil, false, err
 		}
 	}
+}
+
+func storageErrorCode(err error) string {
+	if errors.Is(err, contract.ErrStorageUnavailable) {
+		return "ServiceUnavailable"
+	}
+	return "TechnicalError"
 }
 
 func storageUnavailable(err error, outcome string) error {

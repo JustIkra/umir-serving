@@ -171,11 +171,11 @@ func TestSeparateOrderServicesShareProposalLease(t *testing.T) {
 		<-release
 		return contract.CommitResult{}, errors.New("response lost")
 	}
-	first, err := application.NewOrdersServiceWithOptions(store, warehouse, time.Now, func() string { return "replacement" }, application.OrdersServiceOptions{LeaseHolder: "instance-a", LeaseTTL: time.Second, LeaseWait: 20 * time.Millisecond})
+	first, err := application.NewOrdersServiceWithOptions(store, warehouse, time.Now, func() string { return "replacement" }, application.OrdersServiceOptions{LeaseHolder: "instance-a", LeaseTTL: time.Second, LeaseWait: 20 * time.Millisecond, LeaseClock: time.Now, Wait: testWait})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := application.NewOrdersServiceWithOptions(store, warehouse, time.Now, func() string { return "replacement" }, application.OrdersServiceOptions{LeaseHolder: "instance-b", LeaseTTL: time.Second, LeaseWait: 20 * time.Millisecond})
+	second, err := application.NewOrdersServiceWithOptions(store, warehouse, time.Now, func() string { return "replacement" }, application.OrdersServiceOptions{LeaseHolder: "instance-b", LeaseTTL: time.Second, LeaseWait: 20 * time.Millisecond, LeaseClock: time.Now, Wait: testWait})
 	if err != nil {
 		t.Fatal(err)
 	}

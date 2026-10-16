@@ -25,7 +25,9 @@ type OrdersService struct {
 	leaseHolder   string
 	leaseTTL      time.Duration
 	leaseWait     time.Duration
+	leaseClock    func() time.Time
 	maxPositions  int
+	wait          func(context.Context, time.Duration) error
 }
 
 func NewOrdersService(store ProposalStore, warehouse contract.OrdersWarehouse, now func() time.Time, newID func() string, readers ...contract.OrderAttemptReader) (*OrdersService, error) {
@@ -36,7 +38,9 @@ type OrdersServiceOptions struct {
 	LeaseHolder  string
 	LeaseTTL     time.Duration
 	LeaseWait    time.Duration
+	LeaseClock   func() time.Time
 	MaxPositions int
+	Wait         func(context.Context, time.Duration) error
 }
 
 func NewOrdersServiceWithOptions(store ProposalStore, warehouse contract.OrdersWarehouse, now func() time.Time, newID func() string, options OrdersServiceOptions, readers ...contract.OrderAttemptReader) (*OrdersService, error) {
@@ -56,6 +60,9 @@ func NewOrdersServiceWithOptions(store ProposalStore, warehouse contract.OrdersW
 	if options.MaxPositions == 0 {
 		options.MaxPositions = contract.MaxOrderPositions
 	}
+	if options.Wait != nil && options.LeaseClock == nil {
+		options.LeaseClock = now
+	}
 	if options.LeaseTTL < time.Second || options.LeaseWait < 0 || options.MaxPositions < 1 {
 		return nil, contract.ErrInvalidArgument
 	}
@@ -69,7 +76,9 @@ func NewOrdersServiceWithOptions(store ProposalStore, warehouse contract.OrdersW
 		leaseHolder:  options.LeaseHolder,
 		leaseTTL:     options.LeaseTTL,
 		leaseWait:    options.LeaseWait,
+		leaseClock:   options.LeaseClock,
 		maxPositions: options.MaxPositions,
+		wait:         options.Wait,
 	}
 	if len(readers) > 1 {
 		return nil, contract.ErrInvalidArgument

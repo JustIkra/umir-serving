@@ -125,7 +125,7 @@ func TestResolveCompletedAttemptSavesOneReplacementAndReplaysIt(t *testing.T) {
 func newOrdersServiceWithReader(t *testing.T, store application.ProposalStore, warehouse *warehouseFake, reader contract.OrderAttemptReader) *application.OrdersService {
 	t.Helper()
 	ids := testsupport.NewIDs("generated-proposal-")
-	service, err := application.NewOrdersService(store, warehouse, func() time.Time { return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow) }, ids.Next, reader)
+	service, err := application.NewOrdersServiceWithOptions(store, warehouse, func() time.Time { return time.Date(2026, time.October, 10, 12, 0, 0, 0, testsupport.Moscow) }, ids.Next, application.OrdersServiceOptions{LeaseClock: time.Now, Wait: testWait}, reader)
 	if err != nil {
 		t.Fatalf("NewOrdersService() error = %v", err)
 	}

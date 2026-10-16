@@ -135,16 +135,9 @@ func TestPrepareOrderRejectsMoreThan200PositionsBeforeRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var body strings.Builder
-	body.WriteString(`{"positions":[`)
-	for index := 0; index < 201; index++ {
-		if index > 0 {
-			body.WriteByte(',')
-		}
-		body.WriteString(`{"dishID":"dish-1","portions":"1"}`)
-	}
-	body.WriteString(`]}`)
-	request := httptest.NewRequest(http.MethodPost, "/order-proposals", strings.NewReader(body.String()))
+	position := `{"dishID":"dish-1","portions":"1"}`
+	positions := strings.TrimSuffix(strings.Repeat(position+",", 201), ",")
+	request := httptest.NewRequest(http.MethodPost, "/order-proposals", strings.NewReader(`{"positions":[`+positions+`]}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
