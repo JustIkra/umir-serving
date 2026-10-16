@@ -142,6 +142,8 @@ type logPeer struct {
 	commands      string // "none", "found", "error"
 	badEvaluation bool
 	commits       int
+	gate          chan struct{} // when set, /order-commits waits for it
+	arrived       chan struct{} // receives one value when a commit starts waiting
 }
 
 func (p *logPeer) set(attemptState, commands string) {
@@ -158,6 +160,14 @@ func (p *logPeer) encode(w http.ResponseWriter, value any) {
 
 func (p *logPeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	const at = "2026-10-13T12:00:00+03:00"
+	if p.gate != nil && strings.HasSuffix(r.URL.Path, "/order-commits") {
+		p.arrived <- struct{}{}
+		select {
+		case <-p.gate:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -523,5 +533,202 @@ func TestNewLoggerWritesCommonFields(t *testing.T) {
 	}
 	if timestamp, ok := record["time"].(string); !ok || !strings.HasSuffix(timestamp, "+03:00") {
 		t.Fatalf("time=%v, want +03:00 offset", record["time"])
+	}
+}
+
+func TestLogsNoResolvedForIdentityConflict(t *testing.T) {
+	h := newLogHarness(t)
+	h.prepare()
+	if first := h.request("POST", "/order-confirmations", "confirm", confirmBody); first.Code != 502 {
+		t.Fatalf("first=%d %s", first.Code, first.Body)
+	}
+	h.peer.set("Pending", "found")
+	other := "/order-confirmations/resolve?commandID=command&proposalID=another&runtimeEpoch=" + epochA
+	if got := h.request("GET", other, "resolve", ""); got.Code == 200 {
+		t.Fatalf("identity conflict answered %d %s", got.Code, got.Body)
+	}
+	if resolved := h.logs.events("confirmation.pending.resolved"); len(resolved) != 0 {
+		t.Fatalf("identity conflict logged resolved: %v", resolved)
+	}
+	conflict := h.request("POST", "/order-confirmations", "retry", `{"commandID":"command","proposalID":"another"}`)
+	if conflict.Code == 200 || len(h.logs.events("confirmation.pending.resolved")) != 0 {
+		t.Fatalf("confirm conflict=%d logged=%v", conflict.Code, h.logs.events("confirmation.pending.resolved"))
+	}
+}
+
+func TestLogsContextEndBeforeReservationIsNotAnErrorRecord(t *testing.T) {
+	h := newLogHarness(t)
+	h.prepare()
+	h.peer.gate, h.peer.arrived = make(chan struct{}), make(chan struct{}, 1)
+	var release sync.Once
+	releaseGate := func() { release.Do(func() { close(h.peer.gate) }) }
+	t.Cleanup(releaseGate) // runs before the peer server closes, so a failed assertion cannot hang it
+	runtime, _, err := h.registry.Resolve(context.Background(), s3Scope(tenantA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := canaryVerifier{}.Verify(context.Background(), "confirm"+canaryTokenSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := contract.ConfirmOrderRequest{CommandID: "command", ProposalID: "proposal"}
+	stuck := make(chan error, 1)
+	go func() {
+		_, confirmErr := runtime.ConfirmOrder(contract.WithRequestScope(context.Background(), scope), request)
+		stuck <- confirmErr
+	}()
+	select {
+	case <-h.peer.arrived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first commit never reached the Warehouse")
+	}
+	waiting, cancel := context.WithTimeout(contract.WithRequestScope(context.Background(), scope), 50*time.Millisecond)
+	defer cancel()
+	if _, err = runtime.ConfirmOrder(waiting, request); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued confirm error=%v", err)
+	}
+	unknown := h.logs.events("confirmation.unknown")
+	if len(unknown) != 1 {
+		t.Fatalf("unknown records=%v", unknown)
+	}
+	wantFields(t, unknown[0], map[string]string{"level": "WARN", "error_code": "ContextDone", "cause": "deadline", "command_id": "command"})
+	releaseGate()
+	if confirmErr := <-stuck; confirmErr == nil {
+		t.Fatal("stuck confirm succeeded")
+	}
+	var errorRecords int
+	for _, record := range h.logs.events("confirmation.unknown") {
+		if record["level"] == "ERROR" {
+			errorRecords++
+		}
+	}
+	if errorRecords != 1 {
+		t.Fatalf("ERROR unknown records=%d, want the one lost commit: %v", errorRecords, h.logs.all())
+	}
+}
+
+// blockingLog calls back into the registry while it writes a record, which
+// deadlocks if the registry still holds its mutex.
+type blockingLog struct {
+	memoryLog
+	registry func() *Registry
+}
+
+func (b *blockingLog) Handle(ctx context.Context, record slog.Record) error {
+	b.registry().Status()
+	return b.memoryLog.Handle(ctx, record)
+}
+
+func TestLogsAreWrittenOutsideRegistryLocks(t *testing.T) {
+	var registry *Registry
+	logs := &blockingLog{memoryLog: *newMemoryLog(), registry: func() *Registry { return registry }}
+	var err error
+	registry, err = NewRegistry(RegistryOptions{Epoch: epochA, Now: time.Now, NewID: func() string { return "p" }, Logger: slog.New(logs), WarehouseFactory: func(context.Context, string) (WarehousePorts, error) {
+		w := &warehouseStub{}
+		return WarehousePorts{Orders: w, Catalog: w, Menu: w, Epoch: peerEpoch}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan [2]error, 1)
+	go func() {
+		first := registry.Reconcile(context.Background(), contract.RegistrySnapshot{Revision: "1", Complete: true, Entries: []contract.RegistryRestaurant{{OrgID: orgA, TenantID: tenantB, LifecycleVersion: "1", Lifecycle: "registering"}}})
+		second := registry.Reconcile(context.Background(), contract.RegistrySnapshot{Revision: "2", Complete: false})
+		done <- [2]error{first, second}
+	}()
+	select {
+	case errs := <-done:
+		if errs[0] != nil || errs[1] == nil {
+			t.Fatalf("reconcile errors=%v", errs)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a record was written while the registry mutex was held")
+	}
+	if len(logs.events("reconcile.failed")) != 2 {
+		t.Fatalf("records=%v", logs.all())
+	}
+}
+
+func TestLogsTenantMismatchIsRateLimited(t *testing.T) {
+	logs := newMemoryLog()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	registry, err := NewRegistry(RegistryOptions{Epoch: epochA, Now: func() time.Time { return now }, NewID: func() string { return "p" }, Logger: slog.New(logs), WarehouseFactory: func(context.Context, string) (WarehousePorts, error) {
+		w := &warehouseStub{}
+		return WarehousePorts{Orders: w, Catalog: w, Menu: w, Epoch: peerEpoch}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.Register(context.Background(), s3Registration(tenantA)); err != nil {
+		t.Fatal(err)
+	}
+	scope := contract.RequestScope{OrgID: tenantB, TenantID: tenantA, LifecycleVersion: "1"}
+	for range 50 {
+		if _, _, err = registry.Resolve(context.Background(), scope); err == nil {
+			t.Fatal("mismatch accepted")
+		}
+	}
+	if n := len(logs.events("registry.tenant_mismatch")); n != 1 {
+		t.Fatalf("records=%d, want 1 within the interval", n)
+	}
+	other := scope
+	other.LifecycleVersion = "9"
+	if _, _, err = registry.Resolve(context.Background(), other); err == nil {
+		t.Fatal("mismatch accepted")
+	}
+	if n := len(logs.events("registry.tenant_mismatch")); n != 2 {
+		t.Fatalf("a different presented value was suppressed: %d", n)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, _, err = registry.Resolve(context.Background(), scope); err == nil {
+		t.Fatal("mismatch accepted")
+	}
+	if n := len(logs.events("registry.tenant_mismatch")); n != 3 {
+		t.Fatalf("record after the interval: %d, want 3", n)
+	}
+	for i := range 3 * mismatchLogCapacity {
+		spam := scope
+		spam.OrgID = fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		if _, _, err = registry.Resolve(context.Background(), spam); err == nil {
+			t.Fatal("mismatch accepted")
+		}
+	}
+	registry.mismatchMu.Lock()
+	size := len(registry.mismatchSeen)
+	registry.mismatchMu.Unlock()
+	if size > mismatchLogCapacity {
+		t.Fatalf("dedup map grew to %d", size)
+	}
+}
+
+func TestLogsReconcileCancellationIsQuiet(t *testing.T) {
+	logs := newMemoryLog()
+	registry, err := NewRegistry(RegistryOptions{Epoch: epochA, Now: time.Now, NewID: func() string { return "p" }, Logger: slog.New(logs), WarehouseFactory: func(context.Context, string) (WarehousePorts, error) {
+		w := &warehouseStub{}
+		return WarehousePorts{Orders: w, Catalog: w, Menu: w, Epoch: peerEpoch}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err = registry.Reconcile(canceled, contract.RegistrySnapshot{Revision: "1", Complete: true}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(logs.all()) != 0 {
+		t.Fatalf("shutdown wrote records: %v", logs.all())
+	}
+	expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+	if err = registry.Reconcile(expired, contract.RegistrySnapshot{Revision: "1", Complete: true}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	wantFields(t, logs.one(t, "reconcile.failed"), map[string]string{"reason": "context_done"})
+}
+
+func TestErrorCodeIsBounded(t *testing.T) {
+	long := strings.Repeat("X", 1000)
+	if got := errorCode(&contract.OperationError{Code: long}); len(got) > 64 {
+		t.Fatalf("code length %d", len(got))
 	}
 }

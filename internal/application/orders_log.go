@@ -16,7 +16,8 @@ const (
 	eventConfirmationPendingStarted  = "confirmation.pending.started"
 	eventConfirmationPendingResolved = "confirmation.pending.resolved"
 
-	maxLoggedIDRunes = 256
+	maxLoggedIDRunes   = 256
+	maxLoggedCodeRunes = 64
 )
 
 // WithLogger sets the logger of the service and returns it. Call it while
@@ -49,6 +50,11 @@ func newConfirmTrace(operation string, request contract.ConfirmOrderRequest) *co
 
 func (t *confirmTrace) observeAttempt(attempt contract.ConfirmationAttempt) {
 	t.warehouseEpoch, t.settingsVersion = attempt.Context.Epoch, attempt.Context.SettingsVersion
+}
+
+// markRetained is called once the stored attempt is known to belong to the
+// request (same proposal and fingerprint).
+func (t *confirmTrace) markRetained(attempt contract.ConfirmationAttempt) {
 	t.retainedPending = attempt.State == contract.OrderAttemptPending && attempt.Pending && attempt.Result == nil && attempt.Error == nil
 }
 
@@ -87,14 +93,17 @@ func (s *OrdersService) logConfirmOutcome(ctx context.Context, t *confirmTrace, 
 		if outcome.code == "ProposalNotFound" {
 			level = slog.LevelWarn // a Resolve for a command this process never saw
 		}
-		extra := []slog.Attr{slog.String("error_code", outcome.code), slog.String("outcome", outcome.outcome)}
+		if outcome.code == "ContextDone" && !t.reserved {
+			level = slog.LevelWarn // the context ended before this call sent anything
+		}
+		extra := []slog.Attr{slog.String("error_code", boundedCode(outcome.code)), slog.String("outcome", outcome.outcome)}
 		if outcome.cause != "" {
 			extra = append(extra, slog.String("cause", outcome.cause))
 		}
 		emit(level, eventConfirmationUnknown, extra...)
 	case outcomeTerminal:
 		if t.retainedPending {
-			emit(slog.LevelInfo, eventConfirmationPendingResolved, slog.String("result", outcome.code))
+			emit(slog.LevelInfo, eventConfirmationPendingResolved, slog.String("result", boundedCode(outcome.code)))
 		}
 	}
 }
@@ -140,10 +149,15 @@ func classifyConfirmOutcome(result contract.ConfirmResult, err error) confirmOut
 		}
 	case cause != "":
 		return confirmOutcome{state: outcomeUnknown, outcome: "unknown", code: "ContextDone", cause: cause}
-	case definiteCommitRejection(err):
-		return confirmOutcome{state: outcomeTerminal, code: "Rejected"}
 	}
 	return confirmOutcome{state: outcomeOther}
+}
+
+func boundedCode(value string) string {
+	if utf8.RuneCountInString(value) <= maxLoggedCodeRunes {
+		return value
+	}
+	return string([]rune(value)[:maxLoggedCodeRunes])
 }
 
 // boundedID keeps client-supplied identifiers from growing a record.

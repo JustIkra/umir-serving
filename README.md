@@ -220,20 +220,21 @@ Each of the four transport keys is given either directly (`SERVING_AUTH_KEY`, le
 
 ## Structured logs
 
-The process writes one JSON object per line to stdout (`bootstrap.NewLogger`). Every record has `time` (`+03:00`), `level`, `msg` (equal to `event`, except for `http.server_error`), `event`, `log_schema_version` (1), `service` (`umir-serving`), `version` (VCS revision or `unknown`) and `instance_id`, as in the factory observability format. Records carry identifiers, codes and versions only: no tokens, `Authorization`, request or response bodies, error texts, user IDs or network addresses. Client-supplied IDs are cut at 256 characters. The one exception is `http.server_error`, which relays `net/http` internal messages (for example a handler panic) and may contain the peer address. Every logger is an injected `*slog.Logger` (`Logger` options of `ProcessHTTPOptions`, `HTTPOptions`, `RegistryOptions`, `ScopedHTTPOptions`, `ScopedOptions`, `OrdersService.WithLogger`); the default discards.
+The process writes one JSON object per line to stdout (`bootstrap.NewLogger`). Every record has `time` (`+03:00`), `level`, `msg` (equal to `event`), `event`, `log_schema_version` (1), `service` (`umir-serving`), `version` (VCS revision or `unknown`) and `instance_id`, as in the factory observability format. Records carry identifiers, codes and versions only: no tokens, `Authorization`, request or response bodies, error texts, user IDs or network addresses. Client-supplied IDs are cut at 256 characters. The `net/http` server error log is reduced to an `http.server_error` record with a `kind` (`panic`, `tls_handshake`, `accept`, `other`); its text, peer address and stack are dropped. Every logger is an injected `*slog.Logger` (`Logger` options of `ProcessHTTPOptions`, `HTTPOptions`, `RegistryOptions`, `ScopedHTTPOptions`, `ScopedOptions`, `OrdersService.WithLogger`); the default discards.
 
 | Event | Level | Fields besides the common ones |
 | --- | --- | --- |
-| `confirmation.unknown` | `ERROR` (`WARN` for `ProposalNotFound`) | `operation` (`confirm`/`resolve`), `command_id`, `proposal_id`, `tenant_id`, `org_id`, `runtime_epoch`, `warehouse_epoch`, `settings_version`, `error_code`, `outcome` (`unknown`/`indeterminate`), `cause` (`deadline`/`canceled`, optional) |
+| `confirmation.unknown` | `ERROR` (`WARN` for `ProposalNotFound` and for a context that ended before this call sent anything) | `operation` (`confirm`/`resolve`), `command_id`, `proposal_id`, `tenant_id`, `org_id`, `runtime_epoch`, `warehouse_epoch`, `settings_version`, `error_code`, `outcome` (`unknown`/`indeterminate`), `cause` (`deadline`/`canceled`, optional) |
 | `confirmation.pending.started` | `INFO` | as above; the call reserved the attempt and ended without an outcome |
 | `confirmation.pending.resolved` | `INFO` | as above plus `result` (result kind or error code); a retained pending attempt reached an outcome |
 | `warehouse.protocol_error` | `ERROR` | `tenant_id`, `operation`, `warehouse_epoch`, `error_code` |
 | `reconcile.failed` | `ERROR`; `WARN` for `registering_not_installed` and for a failed Auth or key fetch | `reason`, `error_code`, `revision`, and `tenant_id`, `org_id`, `lifecycle_version` when one entry is at fault |
-| `registry.tenant_mismatch` | `WARN` | `where` (`reconcile`/`resolve`), `reason` (`org_mismatch`/`lifecycle_mismatch`), `tenant_id`, `registered_org_id`, `presented_org_id`, `registered_lifecycle_version`, `presented_lifecycle_version` |
+| `registry.tenant_mismatch` | `WARN`; the same mismatch is written at most once a minute | `where` (`reconcile`/`resolve`), `reason` (`org_mismatch`/`lifecycle_mismatch`), `tenant_id`, `registered_org_id`, `presented_org_id`, `registered_lifecycle_version`, `presented_lifecycle_version` |
 | `http.response_failed` | `WARN`; `ERROR` for encoding | `stage`, `error_kind` |
-| `process.started`, `process.stopped`, `process.start_failed`, `process.failed`, `http.server_error` | `INFO`/`ERROR` | `port`, `error` (startup errors only) |
+| `process.started`, `process.stopped`, `process.start_failed`, `process.failed` | `INFO`/`ERROR` | `port`, `error` (startup errors only) |
+| `http.server_error` | `ERROR` | `kind` |
 
-`reconcile.failed` reasons: `registering_not_installed` (Auth lists a registering restaurant not yet installed here; skipped, logged once per entry, readiness unaffected), `snapshot_invalid`, `revision_invalid`, `revision_rollback`, `invalid_entry`, `ready_not_installed`, `registering_closed_locally`, `tombstone_not_applied`, `tenant_mismatch`, `local_missing_from_snapshot`, `context_done`, and, from the poll loop, `auth_registry_unavailable` and `signing_keys_unavailable`.
+`reconcile.failed` reasons: `registering_not_installed` (Auth lists a registering restaurant not yet installed here; skipped, logged once per entry, readiness unaffected), `snapshot_invalid`, `revision_invalid`, `revision_rollback`, `invalid_entry`, `ready_not_installed`, `registering_closed_locally`, `tombstone_not_applied`, `tenant_mismatch`, `local_missing_from_snapshot`, `context_done` (deadline only; a canceled context at shutdown is silent), and, from the poll loop, `auth_registry_unavailable` and `signing_keys_unavailable`.
 
 ## Совместная работа
 

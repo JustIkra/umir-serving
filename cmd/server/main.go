@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -209,6 +210,29 @@ func startupErrorText(err error) string {
 	return err.Error()
 }
 
+// serverErrorWriter turns the net/http error log into one record with a kind.
+// The messages carry the peer address, panic values and stacks, so none of the
+// text is kept.
+type serverErrorWriter struct{ logger *slog.Logger }
+
+func (w serverErrorWriter) Write(p []byte) (int, error) {
+	kind := "other"
+	switch text := string(p); {
+	case strings.HasPrefix(text, "http: panic serving"):
+		kind = "panic"
+	case strings.HasPrefix(text, "http: TLS handshake error"):
+		kind = "tls_handshake"
+	case strings.HasPrefix(text, "http: Accept error"):
+		kind = "accept"
+	}
+	w.logger.Error("http.server_error", slog.String("event", "http.server_error"), slog.String("kind", kind))
+	return len(p), nil
+}
+
+func newServerErrorLog(logger *slog.Logger) *log.Logger {
+	return log.New(serverErrorWriter{logger: logger}, "", 0)
+}
+
 func fatal(logger *slog.Logger, event string, err error) {
 	logger.Error(event, slog.String("event", event), slog.String("error", startupErrorText(err)))
 	os.Exit(1)
@@ -280,7 +304,7 @@ func main() {
 		fatal(logger, "process.start_failed", err)
 	}
 	server := &http.Server{
-		ErrorLog:          slog.NewLogLogger(logger.With(slog.String("event", "http.server_error")).Handler(), slog.LevelError),
+		ErrorLog:          newServerErrorLog(logger),
 		Addr:              net.JoinHostPort("", strconv.Itoa(port)),
 		Handler:           app,
 		ReadHeaderTimeout: 5 * time.Second,

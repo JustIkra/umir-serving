@@ -54,6 +54,7 @@ func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request c
 		if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 			return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 		}
+		trace.markRetained(attempt)
 		if result, terminalErr, terminal := terminalAttempt(attempt); terminal {
 			contract.RecordWarehouseContext(ctx, result.Context)
 			return result, terminalErr
@@ -381,6 +382,7 @@ func (s *OrdersService) resolveConfirmation(ctx context.Context, request contrac
 	if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 		return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 	}
+	trace.markRetained(attempt)
 	return s.resolveAttempt(ctx, request, attempt, false)
 }
 

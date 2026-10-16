@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 var uuidV4 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -63,5 +67,70 @@ func TestStartupErrorTextDropsTheURL(t *testing.T) {
 	text := startupErrorText(errors.Join(err))
 	if strings.Contains(text, "pass") || strings.Contains(text, "bad host") || !regexp.MustCompile(`^parse: `).MatchString(text) {
 		t.Fatalf("text=%q", text)
+	}
+}
+
+// lockedBuffer lets the server goroutine and the test share one log buffer.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *lockedBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
+func TestServerErrorLogKeepsOnlyAKind(t *testing.T) {
+	var out lockedBuffer
+	logger, err := newProcessLogger(&out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("CANARY-PANIC-VALUE")
+	}))
+	server.Config.ErrorLog = newServerErrorLog(logger)
+	server.Start()
+	defer server.Close()
+	response, err := server.Client().Get(server.URL)
+	if err == nil {
+		if closeErr := response.Body.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(out.String(), "http.server_error") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	text := out.String()
+	if !strings.Contains(text, `"event":"http.server_error"`) || !strings.Contains(text, `"kind":"panic"`) {
+		t.Fatalf("no classified record: %q", text)
+	}
+	host := strings.TrimPrefix(server.URL, "http://")
+	for _, leaked := range []string{"CANARY-PANIC-VALUE", "127.0.0.1", host, "goroutine", "panic serving"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("log contains %q: %s", leaked, text)
+		}
+	}
+	for message, kind := range map[string]string{"http: TLS handshake error from 203.0.113.9:1: EOF": "tls_handshake", "http: Accept error: x; retrying in 5ms": "accept", "something else 203.0.113.9": "other"} {
+		out.Reset()
+		newServerErrorLog(logger).Print(message)
+		if !strings.Contains(out.String(), `"kind":"`+kind+`"`) || strings.Contains(out.String(), "203.0.113.9") {
+			t.Fatalf("%q: %s", message, out.String())
+		}
 	}
 }
