@@ -410,42 +410,34 @@ func (s Snapshot) Projection() contract.RegistrySnapshot {
 	return p
 }
 func (c *Client) WarehouseEpoch(ctx context.Context, tenant, servingEpoch string) (string, error) {
-	snapshot, err := c.Registry(ctx)
+	point, _, err := c.RestaurantPoint(ctx, tenant, "")
 	if err != nil {
 		return "", err
 	}
 	scope, business := contract.RequestScopeFromContext(ctx)
-	for _, t := range snapshot.Tombstones {
-		if t.ID == tenant {
-			return "", &contract.OperationError{Code: "ScopeDeleted", Outcome: "unavailable"}
-		}
+	if point.State == "tombstone" {
+		return "", &contract.OperationError{Code: "ScopeDeleted", Outcome: "unavailable"}
 	}
-	for _, e := range snapshot.Entries {
-		if e.Restaurant.ID != tenant {
-			continue
-		}
-		if business && (e.Restaurant.OrgID != scope.OrgID || e.Restaurant.Version != scope.LifecycleVersion) {
-			return "", &contract.OperationError{Code: "Forbidden", Outcome: "unavailable"}
-		}
-		if e.Restaurant.Lifecycle == "deleting" || e.Restaurant.Lifecycle == "deleted" {
-			return "", &contract.OperationError{Code: "ScopeDeleted", Outcome: "unavailable"}
-		}
-		warehouse := ""
-		serving := ""
-		for _, p := range e.Services {
-			if p.State == "ready" {
-				switch p.Service {
-				case "warehouse":
-					warehouse = p.Epoch
-				case "serving":
-					serving = p.Epoch
-				}
+	e := point.Entry
+	if e == nil || e.Restaurant.Lifecycle == "deleting" || e.Restaurant.Lifecycle == "deleted" {
+		return "", &contract.OperationError{Code: "ScopeDeleted", Outcome: "unavailable"}
+	}
+	if business && (e.Restaurant.OrgID != scope.OrgID || e.Restaurant.Version != scope.LifecycleVersion) {
+		return "", &contract.OperationError{Code: "Forbidden", Outcome: "unavailable"}
+	}
+	warehouse, serving := "", ""
+	for _, peer := range e.Services {
+		if peer.State == "ready" {
+			switch peer.Service {
+			case "warehouse":
+				warehouse = peer.Epoch
+			case "serving":
+				serving = peer.Epoch
 			}
 		}
-		if warehouse == "" || (business && (serving != servingEpoch || e.Restaurant.Lifecycle != "ready")) {
-			return "", &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable", Retryable: true}
-		}
-		return warehouse, nil
 	}
-	return "", &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable", Retryable: true}
+	if warehouse == "" || (business && (serving != servingEpoch || e.Restaurant.Lifecycle != "ready")) {
+		return "", &contract.OperationError{Code: "RuntimeNotReady", Outcome: "unavailable", Retryable: true}
+	}
+	return warehouse, nil
 }

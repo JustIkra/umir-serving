@@ -16,6 +16,42 @@ import (
 	"github.com/JustIkra/umir-serving/contract"
 )
 
+func TestRestaurantPointUsesConditionalPathRead(t *testing.T) {
+	const restaurantID = "33333333-3333-4333-8333-333333333333"
+	const orgID = "22222222-2222-4222-8222-222222222222"
+	const warehouseEpoch = "44444444-4444-4444-8444-444444444444"
+	const servingEpoch = "55555555-5555-4555-8555-555555555555"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/auth/v1/registry/"+restaurantID || r.Header.Get("X-Umir-Service-Key") != "point-reader" {
+			t.Errorf("request path/credential = %s/%s", r.URL.Path, r.Header.Get("X-Umir-Service-Key"))
+		}
+		if r.Header.Get("If-None-Match") == `"7"` {
+			w.Header().Set("ETag", `"7"`)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"7"`)
+		if _, err := w.Write([]byte(`{"registryRevision":"7","state":"live","entry":{"restaurant":{"restaurantID":"` + restaurantID + `","orgID":"` + orgID + `","name":"Cafe","lifecycle":"ready","lifecycleVersion":"2"},"settings":{"timeZone":"Europe/Moscow","settingsVersion":"3"},"services":[{"restaurantID":"` + restaurantID + `","service":"warehouse","epoch":"` + warehouseEpoch + `","state":"ready","lifecycleVersion":"2"},{"restaurantID":"` + restaurantID + `","service":"serving","epoch":"` + servingEpoch + `","state":"ready","lifecycleVersion":"2"}]}}`)); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "point-reader", server.Client(), time.Second, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	point, notModified, err := client.RestaurantPoint(t.Context(), restaurantID, "")
+	if err != nil || notModified || point.Revision != "7" || point.Entry == nil || point.Entry.Restaurant.ID != restaurantID || point.Entry.Services[0].Epoch != warehouseEpoch {
+		t.Fatalf("point = (%+v, %v, %v)", point, notModified, err)
+	}
+	_, notModified, err = client.RestaurantPoint(t.Context(), restaurantID, `"7"`)
+	if err != nil || !notModified {
+		t.Fatalf("conditional point = (notModified %v, %v)", notModified, err)
+	}
+}
+
 const testTenant = "33333333-3333-4333-8333-333333333333"
 const testOrg = "22222222-2222-4222-8222-222222222222"
 const testEpoch = "44444444-4444-4444-8444-444444444444"
@@ -221,7 +257,14 @@ func TestS4AuthPeerEpochRequiresMatchingCurrentReadiness(t *testing.T) {
 				}
 				p["state"] = "pending"
 			}
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { testWrite(t, w, v) }))
+			point := map[string]any{"registryRevision": "1", "state": "live", "entry": entry}
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/internal/auth/v1/registry/"+testTenant {
+					t.Errorf("point path=%s", r.URL.Path)
+				}
+				w.Header().Set("ETag", `"1"`)
+				testWrite(t, w, point)
+			}))
 			defer s.Close()
 			scope := contract.RequestScope{OrgID: testOrg, TenantID: testTenant, LifecycleVersion: "1"}
 			if kind == "wrong-org" {
