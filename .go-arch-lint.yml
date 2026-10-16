@@ -6,6 +6,9 @@ allow:
   ignoreNotFoundComponents: true
 excludeFiles:
   - "^.*internal/application/.*_test\\.go$"
+vendors:
+  pgx: {in: ["github.com/jackc/pgx/v5", "github.com/jackc/pgx/v5/**"]}
+  amqp: {in: ["github.com/rabbitmq/amqp091-go"]}
 components:
   domain: {in: "internal/domain/**"}
   contract: {in: "contract/**"}
@@ -24,6 +27,7 @@ deps:
     mayDependOn: [application, domain, contract]
   adapters:
     mayDependOn: [adapters, application, domain, contract]
+    canUse: [pgx, amqp]
   bootstrap:
     mayDependOn: [bootstrap, application, adapters, contract]
   process:
@@ -32,3 +36,4 @@ deps:
     mayDependOn: [testsupport, domain, contract]
   tests:
     mayDependOn: [tests, testsupport, application, adapters, domain, contract, bootstrap]
+    canUse: [pgx, amqp]

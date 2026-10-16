@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Feat: durable storage foundation. The reference PostgreSQL and RabbitMQ adapters of `umir-factory reference/durable` are copied unchanged to `internal/adapters/postgres` and `internal/adapters/rabbitmq` (R15, copy made with `copy.sh`), the Serving schema `0001_init.sql` (restaurant registrations, proposals, confirmation attempts, the first storage generation, row level security on the three restaurant tables) lives in `internal/adapters/pgstore`, and `make integration` runs the integration suite on real PostgreSQL and RabbitMQ.
+
 - Fix: an invalid `SERVING_INSTANCE_ID` no longer fails the `healthcheck` subcommand; the server still refuses to start with it.
 
 - Feat: service keys can be read from files. `SERVING_AUTH_KEY`, `AUTH_RUNTIME_KEY`, `GATEWAY_SERVING_KEY` and `SERVING_WAREHOUSE_KEY` each accept a `<NAME>_FILE` variable with the path of a file holding the key, for the secret-file deployment profile; the plain variables keep working. One trailing line break is removed from the file value, nothing else. Setting both forms of one key, an empty or unreadable file, or a file over 64 KiB stops the start with an error that names the variable and never contains the value (checked with canary values in errors and logs).
