@@ -58,7 +58,12 @@ func secretEnv(getenv func(string) string, name string) (string, error) {
 	if len(data) > secretFileMaxBytes {
 		return "", fmt.Errorf("%s_FILE: file is too large", name)
 	}
-	secret := strings.TrimRight(string(data), "\r\n")
+	secret := string(data)
+	if strings.HasSuffix(secret, "\r\n") {
+		secret = secret[:len(secret)-2]
+	} else {
+		secret = strings.TrimSuffix(secret, "\n")
+	}
 	if secret == "" {
 		return "", fmt.Errorf("%s_FILE: file is empty", name)
 	}
@@ -284,12 +289,24 @@ func newProcessLogger(w io.Writer) (*slog.Logger, error) {
 	return bootstrap.NewLogger(w, id, buildVersion(), slog.LevelInfo), err
 }
 
+func isHealthcheck(args []string) bool { return len(args) == 2 && args[1] == "healthcheck" }
+
+// processLogger builds the logger of a command. The healthcheck subcommand
+// writes no replica records, so an invalid SERVING_INSTANCE_ID does not fail it.
+func processLogger(args []string, w io.Writer) (*slog.Logger, error) {
+	logger, err := newProcessLogger(w)
+	if isHealthcheck(args) {
+		return logger, nil
+	}
+	return logger, err
+}
+
 func main() {
-	logger, idErr := newProcessLogger(os.Stdout)
+	logger, idErr := processLogger(os.Args, os.Stdout)
 	if idErr != nil {
 		fatal(logger, "process.start_failed", idErr)
 	}
-	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+	if isHealthcheck(os.Args) {
 		if err := healthcheck(); err != nil {
 			fatal(logger, "process.healthcheck_failed", err)
 		}

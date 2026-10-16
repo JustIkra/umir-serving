@@ -48,6 +48,8 @@ func TestSecretEnvReadsFileAndTrimsOnlyTrailingNewline(t *testing.T) {
 		"crlf":         {secretCanary + "\r\n", secretCanary},
 		"inner spaces": {" a b \n", " a b "},
 		"inner lf":     {"a\nb\n", "a\nb"},
+		"two lf":       {secretCanary + "\n\n", secretCanary + "\n"},
+		"crlf then lf": {secretCanary + "\r\n\n", secretCanary + "\r\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := writeSecretFile(t, tc.content)
