@@ -1,5 +1,7 @@
 package contract
 
+import "time"
+
 type CommitResult struct {
 	Context         WarehouseContext
 	Kind            CommitResultKind
@@ -48,6 +50,13 @@ type ConfirmationAttempt struct {
 	WarehouseResult   *CommitResult
 	Replacement       *OrderProposal
 	Error             *AttemptError
+	// Bookkeeping of the background reconciler (zero time means unset).
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	CheckCount   int
+	NextCheckAt  time.Time
+	StuckAt      time.Time
+	UnresolvedAt time.Time
 }
 
 func (a ConfirmationAttempt) Clone() ConfirmationAttempt {

@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Refactor: the store ports gain a fenced per-proposal lease (`AcquireLease`, `ReleaseLease`, token in the context via `application.WithLease`), check bookkeeping for the reconciler (`RecordCheck`, `MarkUnresolved`) and a limit of active proposals; the pure position functions move to `internal/domain`; store errors are shared in `internal/domain`. One behavior suite, `tests/storecontract`, covers the in-process store (and the PostgreSQL store next); the older store tests are folded into it. A replacement proposal remembered on an attempt is written once and never overwritten.
+
 - Feat: durable storage foundation. The reference PostgreSQL and RabbitMQ adapters of `umir-factory reference/durable` are copied unchanged to `internal/adapters/postgres` and `internal/adapters/rabbitmq` (R15, copy made with `copy.sh`), the Serving schema `0001_init.sql` (restaurant registrations, proposals, confirmation attempts, the first storage generation, row level security on the three restaurant tables) lives in `internal/adapters/pgstore`, and `make integration` runs the integration suite on real PostgreSQL and RabbitMQ.
 
 - Fix: an invalid `SERVING_INSTANCE_ID` no longer fails the `healthcheck` subcommand; the server still refuses to start with it.

@@ -2,36 +2,67 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/JustIkra/umir-serving/contract"
+	"github.com/JustIkra/umir-serving/internal/application"
 	"github.com/JustIkra/umir-serving/internal/domain"
 )
 
 var (
-	ErrInvalidProposal         = errors.New("invalid proposal")
-	ErrProposalExists          = errors.New("proposal already exists")
-	ErrProposalMissing         = errors.New("proposal not found")
-	ErrPendingMismatch         = errors.New("pending command identity mismatch")
-	ErrProposalReplaced        = errors.New("proposal already replaced")
-	ErrInvalidReplace          = errors.New("invalid proposal replacement")
+	ErrInvalidProposal         = domain.ErrInvalidProposal
+	ErrProposalExists          = domain.ErrProposalExists
+	ErrProposalMissing         = domain.ErrProposalMissing
+	ErrPendingMismatch         = domain.ErrPendingMismatch
+	ErrProposalReplaced        = domain.ErrProposalReplaced
+	ErrInvalidReplace          = domain.ErrInvalidReplace
 	ErrCommandIdentityConflict = contract.ErrCommandIdentityConflict
 )
 
+// activeProposalWindow is how long an unsettled proposal counts as active.
+const activeProposalWindow = 24 * time.Hour
+
+// ProposalStore is the in-process store of one restaurant. It is the test and
+// fixture counterpart of the PostgreSQL store and follows the same contract.
 type ProposalStore struct {
 	mu        sync.RWMutex
-	proposals map[string]domain.ProposalRecord
+	now       func() time.Time
+	maxActive int
+	proposals map[string]*proposalEntry
 	attempts  map[string]contract.ConfirmationAttempt
 }
 
-func NewProposalStore() *ProposalStore {
-	return &ProposalStore{
-		proposals: make(map[string]domain.ProposalRecord),
+type proposalEntry struct {
+	record     domain.ProposalRecord
+	settled    bool
+	leaseHold  string
+	leaseUntil time.Time
+	leaseSeq   int64
+}
+
+// Option configures a ProposalStore.
+type Option func(*ProposalStore)
+
+// WithClock sets the time source of leases and bookkeeping.
+func WithClock(now func() time.Time) Option { return func(s *ProposalStore) { s.now = now } }
+
+// WithMaxActiveProposals limits the unsettled proposals younger than 24 hours;
+// zero means no limit.
+func WithMaxActiveProposals(limit int) Option { return func(s *ProposalStore) { s.maxActive = limit } }
+
+func NewProposalStore(options ...Option) *ProposalStore {
+	s := &ProposalStore{
+		now:       time.Now,
+		proposals: make(map[string]*proposalEntry),
 		attempts:  make(map[string]contract.ConfirmationAttempt),
 	}
+	for _, option := range options {
+		option(s)
+	}
+	return s
 }
 
 func (s *ProposalStore) BeginAttempt(ctx context.Context, attempt contract.ConfirmationAttempt) (contract.ConfirmationAttempt, bool, error) {
@@ -52,25 +83,30 @@ func (s *ProposalStore) BeginAttempt(ctx context.Context, attempt contract.Confi
 		}
 		return existing.Clone(), false, nil
 	}
-	proposal, found := s.proposals[attempt.ProposalID]
+	entry, found := s.proposals[attempt.ProposalID]
 	if !found {
 		if attempt.Pending || len(attempt.AcceptedPositions) > 0 {
 			return contract.ConfirmationAttempt{}, false, ErrProposalMissing
 		}
 	} else {
-		if proposal.SupersededBy != "" && attempt.Pending {
+		if entry.record.SupersededBy != "" && attempt.Pending {
 			return contract.ConfirmationAttempt{}, false, ErrProposalReplaced
 		}
-		if attempt.Pending && proposal.PendingCommandID != "" && proposal.PendingCommandID != attempt.CommandID {
+		if attempt.Pending && entry.record.PendingCommandID != "" && entry.record.PendingCommandID != attempt.CommandID {
 			return contract.ConfirmationAttempt{}, false, contract.ErrConfirmationPending
 		}
 	}
+	now := s.now()
 	attempt.State = contract.OrderAttemptPending
+	attempt.CreatedAt, attempt.UpdatedAt = now, now
+	attempt.CheckCount, attempt.NextCheckAt, attempt.StuckAt, attempt.UnresolvedAt = 0, time.Time{}, time.Time{}, time.Time{}
+	if attempt.Pending {
+		attempt.NextCheckAt = now
+	}
 	attempt = attempt.Clone()
 	s.attempts[attempt.CommandID] = attempt
 	if attempt.Pending {
-		proposal.PendingCommandID = attempt.CommandID
-		s.proposals[attempt.ProposalID] = proposal
+		entry.record.PendingCommandID = attempt.CommandID
 	}
 	return attempt.Clone(), true, nil
 }
@@ -81,11 +117,20 @@ func (s *ProposalStore) GetAttempt(ctx context.Context, commandID string) (contr
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if err := ctx.Err(); err != nil {
-		return contract.ConfirmationAttempt{}, false, err
-	}
 	attempt, found := s.attempts[commandID]
 	return attempt.Clone(), found, nil
+}
+
+// fenced refuses a write whose lease token was overtaken by another holder.
+func (s *ProposalStore) fenced(ctx context.Context, proposalID string) error {
+	lease, ok := application.LeaseFromContext(ctx)
+	if !ok || lease.ProposalID != proposalID {
+		return nil
+	}
+	if entry, found := s.proposals[proposalID]; found && entry.leaseSeq != lease.Seq {
+		return domain.ErrLeaseLost
+	}
+	return nil
 }
 
 func (s *ProposalStore) ReserveAttempt(ctx context.Context, commandID string) error {
@@ -94,26 +139,29 @@ func (s *ProposalStore) ReserveAttempt(ctx context.Context, commandID string) er
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	attempt, found := s.attempts[commandID]
 	if !found || attempt.State != contract.OrderAttemptPending {
 		return ErrProposalMissing
 	}
-	proposal, found := s.proposals[attempt.ProposalID]
+	entry, found := s.proposals[attempt.ProposalID]
 	if !found {
 		return ErrProposalMissing
 	}
-	if proposal.SupersededBy != "" {
+	if err := s.fenced(ctx, attempt.ProposalID); err != nil {
+		return err
+	}
+	if entry.record.SupersededBy != "" {
 		return ErrProposalReplaced
 	}
-	if proposal.PendingCommandID != "" && proposal.PendingCommandID != commandID {
+	if entry.record.PendingCommandID != "" && entry.record.PendingCommandID != commandID {
 		return contract.ErrConfirmationPending
 	}
-	proposal.PendingCommandID = commandID
-	attempt.Pending = true
-	s.proposals[attempt.ProposalID] = proposal
+	entry.record.PendingCommandID = commandID
+	if !attempt.Pending {
+		attempt.Pending = true
+		attempt.NextCheckAt = s.now()
+		attempt.UpdatedAt = attempt.NextCheckAt
+	}
 	s.attempts[commandID] = attempt
 	return nil
 }
@@ -124,12 +172,12 @@ func (s *ProposalStore) RememberWarehouseResult(ctx context.Context, commandID s
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	attempt, found := s.attempts[commandID]
 	if !found {
 		return ErrProposalMissing
+	}
+	if err := s.fenced(ctx, attempt.ProposalID); err != nil {
+		return err
 	}
 	if attempt.State != contract.OrderAttemptPending {
 		if attempt.WarehouseResult != nil && sameCommitResult(*attempt.WarehouseResult, result) {
@@ -142,10 +190,12 @@ func (s *ProposalStore) RememberWarehouseResult(ctx context.Context, commandID s
 	}
 	clonedResult := result.Clone()
 	attempt.WarehouseResult = &clonedResult
-	if replacement != nil {
+	// The replacement is written once and never overwritten.
+	if replacement != nil && attempt.Replacement == nil {
 		clonedReplacement := replacement.Clone()
 		attempt.Replacement = &clonedReplacement
 	}
+	attempt.UpdatedAt = s.now()
 	s.attempts[commandID] = attempt
 	return nil
 }
@@ -160,9 +210,6 @@ func (s *ProposalStore) CompleteAttempt(ctx context.Context, commandID string, r
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	attempt, found := s.attempts[commandID]
 	if !found {
 		return ErrProposalMissing
@@ -177,30 +224,41 @@ func (s *ProposalStore) CompleteAttempt(ctx context.Context, commandID string, r
 		}
 		return ErrCommandIdentityConflict
 	}
-	proposal, found := s.proposals[attempt.ProposalID]
+	if err := s.fenced(ctx, attempt.ProposalID); err != nil {
+		return err
+	}
+	entry, found := s.proposals[attempt.ProposalID]
 	if !found && (attempt.Pending || replacement != nil) {
 		return ErrProposalMissing
 	}
+	var newEntry *proposalEntry
 	if attempt.Pending {
-		if proposal.PendingCommandID != commandID {
+		if entry.record.PendingCommandID != commandID {
 			return ErrPendingMismatch
 		}
 		if replacement != nil {
-			if replacement.ProposalID == "" || replacement.ProposalID == attempt.ProposalID || !acceptedPositionsWithin(replacement.AcceptedPositions, proposal.Proposal.AcceptedPositions) {
+			if replacement.ProposalID == "" || replacement.ProposalID == attempt.ProposalID || !domain.AcceptedWithin(replacement.AcceptedPositions, entry.record.Proposal.AcceptedPositions) {
 				return ErrInvalidReplace
 			}
 			if _, exists := s.proposals[replacement.ProposalID]; exists {
 				return ErrProposalExists
 			}
-			replacement = cloneProposalPointer(replacement)
-			replacement.RequestedPositions = requestedFromAccepted(proposal.Proposal.AcceptedPositions)
-			proposal.PendingCommandID = ""
-			proposal.SupersededBy = replacement.ProposalID
-			s.proposals[replacement.ProposalID] = domain.ProposalRecord{Proposal: *replacement}
-		} else {
-			proposal.PendingCommandID = ""
+			cloned := replacement.Clone()
+			cloned.RequestedPositions = domain.RequestedFromAccepted(entry.record.Proposal.AcceptedPositions)
+			newEntry = &proposalEntry{record: domain.ProposalRecord{Proposal: cloned}}
 		}
-		s.proposals[attempt.ProposalID] = proposal
+	}
+	// All checks passed: from here the change is applied as a whole.
+	if attempt.Pending {
+		entry.record.PendingCommandID = ""
+		if newEntry != nil {
+			entry.record.SupersededBy = newEntry.record.Proposal.ProposalID
+			entry.settled = true
+			s.proposals[newEntry.record.Proposal.ProposalID] = newEntry
+		}
+	}
+	if entry != nil && rejection == nil && result.Kind == contract.OrderConfirmed {
+		entry.settled = true
 	}
 	attempt.State = wantState
 	if rejection == nil {
@@ -213,13 +271,80 @@ func (s *ProposalStore) CompleteAttempt(ctx context.Context, commandID string, r
 	attempt.WarehouseResult = nil
 	attempt.Replacement = nil
 	attempt.Pending = false
+	attempt.NextCheckAt = time.Time{}
+	attempt.UpdatedAt = s.now()
 	s.attempts[commandID] = attempt
 	return nil
 }
 
-func cloneProposalPointer(proposal *domain.OrderProposal) *domain.OrderProposal {
-	cloned := proposal.Clone()
-	return &cloned
+func (s *ProposalStore) AcquireLease(ctx context.Context, proposalID, holder string, ttl time.Duration) (application.Lease, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return application.Lease{}, false, err
+	}
+	if proposalID == "" || holder == "" || ttl <= 0 {
+		return application.Lease{}, false, ErrInvalidProposal
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, found := s.proposals[proposalID]
+	if !found {
+		return application.Lease{ProposalID: proposalID, Holder: holder}, true, nil
+	}
+	now := s.now()
+	if entry.leaseHold != "" && entry.leaseUntil.After(now) {
+		return application.Lease{}, false, nil
+	}
+	entry.leaseSeq++
+	entry.leaseHold, entry.leaseUntil = holder, now.Add(ttl)
+	return application.Lease{ProposalID: proposalID, Holder: holder, Seq: entry.leaseSeq}, true, nil
+}
+
+func (s *ProposalStore) ReleaseLease(_ context.Context, lease application.Lease) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, found := s.proposals[lease.ProposalID]; found && entry.leaseSeq == lease.Seq && entry.leaseHold == lease.Holder {
+		entry.leaseHold, entry.leaseUntil = "", time.Time{}
+	}
+	return nil
+}
+
+func (s *ProposalStore) RecordCheck(ctx context.Context, commandID string, delay time.Duration, stuck bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attempt, found := s.attempts[commandID]
+	if !found {
+		return ErrProposalMissing
+	}
+	now := s.now()
+	attempt.CheckCount++
+	attempt.NextCheckAt = now.Add(delay)
+	if stuck && attempt.StuckAt.IsZero() {
+		attempt.StuckAt = now
+	}
+	attempt.UpdatedAt = now
+	s.attempts[commandID] = attempt
+	return nil
+}
+
+func (s *ProposalStore) MarkUnresolved(ctx context.Context, commandID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attempt, found := s.attempts[commandID]
+	if !found {
+		return ErrProposalMissing
+	}
+	if attempt.UnresolvedAt.IsZero() {
+		attempt.UnresolvedAt = s.now()
+		attempt.UpdatedAt = attempt.UnresolvedAt
+		s.attempts[commandID] = attempt
+	}
+	return nil
 }
 
 func sameAcceptedPositions(left, right []contract.AcceptedPosition) bool {
@@ -243,13 +368,21 @@ func (s *ProposalStore) Create(ctx context.Context, proposal domain.OrderProposa
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	if _, exists := s.proposals[proposal.ProposalID]; exists {
 		return fmt.Errorf("%w: %s", ErrProposalExists, proposal.ProposalID)
 	}
-	s.proposals[proposal.ProposalID] = domain.ProposalRecord{Proposal: proposal.Clone()}
+	if s.maxActive > 0 {
+		cutoff, active := s.now().Add(-activeProposalWindow), 0
+		for _, entry := range s.proposals {
+			if !entry.settled && entry.record.Proposal.EvaluatedAt.After(cutoff) {
+				active++
+			}
+		}
+		if active >= s.maxActive {
+			return contract.ErrLimitExceeded
+		}
+	}
+	s.proposals[proposal.ProposalID] = &proposalEntry{record: domain.ProposalRecord{Proposal: proposal.Clone()}}
 	return nil
 }
 
@@ -259,46 +392,11 @@ func (s *ProposalStore) Get(ctx context.Context, proposalID string) (domain.Prop
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if err := ctx.Err(); err != nil {
-		return domain.ProposalRecord{}, false, err
-	}
-	record, ok := s.proposals[proposalID]
+	entry, ok := s.proposals[proposalID]
 	if !ok {
 		return domain.ProposalRecord{}, false, nil
 	}
+	record := entry.record
 	record.Proposal = record.Proposal.Clone()
 	return record, true, nil
-}
-
-func acceptedPositionsWithin(next, previous []domain.AcceptedPosition) bool {
-	limits := make(map[int]domain.AcceptedPosition, len(previous))
-	for _, position := range previous {
-		if position.Portions <= 0 || position.DishID == "" {
-			return false
-		}
-		if _, exists := limits[position.LineNo]; exists {
-			return false
-		}
-		limits[position.LineNo] = position
-	}
-	seen := make(map[int]struct{}, len(next))
-	for _, position := range next {
-		limit, ok := limits[position.LineNo]
-		if !ok || position.DishID != limit.DishID || position.Portions <= 0 || position.Portions > limit.Portions {
-			return false
-		}
-		if _, exists := seen[position.LineNo]; exists {
-			return false
-		}
-		seen[position.LineNo] = struct{}{}
-	}
-	return true
-}
-
-func requestedFromAccepted(positions []domain.AcceptedPosition) []domain.Position {
-	requested := make([]domain.Position, len(positions))
-	for i, position := range positions {
-		requested[i] = domain.Position(position)
-	}
-	return requested
 }
