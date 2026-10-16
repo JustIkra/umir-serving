@@ -89,3 +89,25 @@ func TestRetainedCommitStaysStrictAboutSettings(t *testing.T) {
 		t.Fatalf("retained commit with other settings: %v", err)
 	}
 }
+
+// CR 01: these codes are not in the public Error.code enum. Only the legacy
+// parser can produce them; the scoped client must refuse them with the generic WarehouseUnavailable error, which the HTTP
+// handler reports as UpstreamUnavailable, so that none of them reaches Gateway as an unknown code.
+func TestScopedClientRefusesCodesOutsideTheEnum(t *testing.T) {
+	scope := s2Scope("servingDish", "catalog.read")
+	for _, code := range []string{"ProposalSuperseded", "ProductNotFound", "DishNotFound"} {
+		t.Run(code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				writeResponse(t, w, `{"code":"`+code+`","message":"absent","outcome":"unavailable","retryable":false}`)
+			}))
+			defer server.Close()
+			_, err := s2Client(t, server, scope).GetDish(contract.WithRequestScope(context.Background(), scope), "absent")
+			var operation *contract.OperationError
+			if !errors.As(err, &operation) || operation.Code != "WarehouseUnavailable" || operation.Outcome != "unavailable" {
+				t.Fatalf("%s: got %v, want the generic WarehouseUnavailable refusal", code, err)
+			}
+		})
+	}
+}
