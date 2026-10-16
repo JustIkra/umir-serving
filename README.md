@@ -276,3 +276,8 @@ Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) and [
 Release repositories independently. Use annotated `vX.Y.Z` tags for actual releases; published nested Go modules prefix tags with the logical module subdirectory (excluding a trailing major-version directory), and Go v2+ needs the matching major import path. Published tags/versions stay immutable. Record changes under Unreleased before releasing. Preserve Umir `sha-<full-SHA>` image identities and exact factory component pins; SemVer does not replace them with `latest`. API versions and service releases are separate.
 
 Preserve unrelated local edits, stage reviewed paths and check `git diff --cached` and `git diff --check`. Tagging, publishing and shared-history rewrites require the corresponding user instruction. This standard does not create a release or change the current version.
+
+
+## Durable storage (wave 2, in progress)
+
+Done on this branch: the copied reference adapters (`internal/adapters/postgres`, `internal/adapters/rabbitmq`), the Serving schema and PostgreSQL store (`internal/adapters/pgstore`), the shared store contract suite (`tests/storecontract`), `make integration` (needs `UMIR_TEST_DATABASE_URL` and `UMIR_TEST_AMQP_URL` from `umir-factory scripts/durable-test-infra.sh env`). Not wired yet: the running service still keeps state in memory, uses a per-process epoch and polls the Auth registry. The sections of this README that describe in-memory state stay true until the remaining wave 2 tasks land.
