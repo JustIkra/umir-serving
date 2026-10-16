@@ -33,7 +33,8 @@ func TestS2RefusalAcrossScopedComposition(t *testing.T) {
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(want)
-				if _, err := fmt.Fprintf(w, `{"code":%q,"message":"Warehouse refusal","outcome":"unavailable","retryable":false}`, code); err != nil {
+				retryable := want == http.StatusTooManyRequests
+				if _, err := fmt.Fprintf(w, `{"code":%q,"message":"Warehouse refusal","outcome":"unavailable","retryable":%t}`, code, retryable); err != nil {
 					t.Error(err)
 				}
 			}))
