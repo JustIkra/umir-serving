@@ -537,6 +537,17 @@ func leaseFence(t *testing.T, f Factory) {
 	if err := s.RememberWarehouseResult(application.WithLease(ctxBG(), a), "command-1", contract.CommitResult{Kind: contract.OrderCommitted, Order: &contract.Order{OrderID: "o", ProposalID: "proposal-1"}}, nil); !errors.Is(err, domain.ErrLeaseLost) {
 		t.Fatalf("stale remember error = %v, want ErrLeaseLost", err)
 	}
+	proposal, _ := getProposal(t, s, "proposal-1")
+	staleAttempt := contract.ConfirmationAttempt{CommandID: "command-2", ProposalID: "proposal-1", Fingerprint: "fp-command-2", AcceptedPositions: accepted(proposal)}
+	if _, created, err := s.BeginAttempt(application.WithLease(ctxBG(), a), staleAttempt); !errors.Is(err, domain.ErrLeaseLost) || created {
+		t.Fatalf("stale BeginAttempt = created %v, error %v; want ErrLeaseLost without creation", created, err)
+	}
+	if _, found, err := s.GetAttempt(ctxBG(), "command-2"); err != nil || found {
+		t.Fatalf("stale attempt persisted = found %v, error %v; want no attempt", found, err)
+	}
+	if _, created, err := s.BeginAttempt(application.WithLease(ctxBG(), b), staleAttempt); err != nil || !created {
+		t.Fatalf("current BeginAttempt = created %v, error %v; want successful creation", created, err)
+	}
 	if err := s.CompleteAttempt(application.WithLease(ctxBG(), b), "command-1", contract.ConfirmResult{Kind: contract.EmptyOrder}, nil, nil); err != nil {
 		t.Fatalf("fresh write refused: %v", err)
 	}

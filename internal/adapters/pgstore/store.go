@@ -370,16 +370,14 @@ func (s *Store) BeginAttempt(ctx context.Context, a contract.ConfirmationAttempt
 		} else if ok {
 			return s.compare(existing, a, &result, &conflict)
 		}
-		var superseded *string
-		proposalErr := tx.QueryRow(ctx, `SELECT superseded_by FROM serving_proposals WHERE restaurant_id = $1 AND proposal_id = $2 FOR SHARE`, s.restaurantID, a.ProposalID).Scan(&superseded)
-		missing := errors.Is(proposalErr, pgx.ErrNoRows)
-		if proposalErr != nil && !missing {
-			return proposalErr
+		proposal, err := s.lockProposal(ctx, tx, a.ProposalID, false)
+		if err != nil {
+			return err
 		}
-		if missing && (a.Pending || len(a.AcceptedPositions) > 0) {
+		if !proposal.found && (a.Pending || len(a.AcceptedPositions) > 0) {
 			return domain.ErrProposalMissing
 		}
-		if !missing && superseded != nil && a.Pending {
+		if proposal.supersedes != nil && a.Pending {
 			return domain.ErrProposalReplaced
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO serving_confirmation_attempts

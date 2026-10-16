@@ -45,7 +45,7 @@ func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request c
 
 	attempt, found, err := s.attempts.GetAttempt(ctx, request.CommandID)
 	if err != nil {
-		return contract.ConfirmResult{}, preCommitStorageError(err)
+		return contract.ConfirmResult{}, unknownLookupError(err)
 	}
 	if found {
 		trace.observeAttempt(attempt)
@@ -619,6 +619,9 @@ func unknownCompletionError(err error) error {
 }
 
 func unknownLookupError(err error) error {
+	if errors.Is(err, contract.ErrStorageUnavailable) {
+		return storageUnavailable(err, "unknown")
+	}
 	var operation *contract.OperationError
 	if errors.As(err, &operation) {
 		value := *operation

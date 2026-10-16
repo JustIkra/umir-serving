@@ -92,6 +92,9 @@ func (s *ProposalStore) BeginAttempt(ctx context.Context, attempt contract.Confi
 			return contract.ConfirmationAttempt{}, false, ErrProposalMissing
 		}
 	} else {
+		if err := s.fenced(ctx, attempt.ProposalID); err != nil {
+			return contract.ConfirmationAttempt{}, false, err
+		}
 		if entry.record.SupersededBy != "" && attempt.Pending {
 			return contract.ConfirmationAttempt{}, false, ErrProposalReplaced
 		}

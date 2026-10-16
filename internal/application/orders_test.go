@@ -527,6 +527,40 @@ func TestRecordedWarehouseIdentityCannotBePoisonedByFreshServingBinding(t *testi
 	}
 }
 
+func TestInitialAttemptLookupFailurePreservesUnknownOutcome(t *testing.T) {
+	base := memory.NewProposalStore()
+	createProposal(t, base, proposalFixture("proposal-1", 1))
+	if _, _, err := base.BeginAttempt(context.Background(), contract.ConfirmationAttempt{
+		CommandID: "command-1", ProposalID: "proposal-1", Fingerprint: confirmFingerprint("proposal-1"),
+		AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}, Pending: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	warehouse := newWarehouseFake()
+	order := contract.Order{OrderID: "order-1", ProposalID: "proposal-1", Positions: []contract.AcceptedPosition{{LineNo: 3, DishID: "dish-1", Portions: 1}}}
+	warehouse.recorded["command-1"] = commandRecord("command-1", "proposal-1", order)
+	store := &attemptLookupFailureStore{ProposalStore: base, err: contract.ErrStorageUnavailable}
+	service := newOrdersService(t, store, warehouse)
+
+	_, err := service.ConfirmOrder(context.Background(), contract.ConfirmOrderRequest{CommandID: "command-1", ProposalID: "proposal-1"})
+	var operation *contract.OperationError
+	if !errors.As(err, &operation) || operation.Code != "ServiceUnavailable" || operation.Outcome != "unknown" {
+		t.Fatalf("ConfirmOrder() error = %#v, want ServiceUnavailable/unknown", err)
+	}
+	if _, commits := warehouse.commits(); commits != 0 {
+		t.Fatalf("Warehouse commit calls = %d, want no new commit after the uncertain lookup", commits)
+	}
+}
+
+type attemptLookupFailureStore struct {
+	*memory.ProposalStore
+	err error
+}
+
+func (s *attemptLookupFailureStore) GetAttempt(context.Context, string) (contract.ConfirmationAttempt, bool, error) {
+	return contract.ConfirmationAttempt{}, false, s.err
+}
+
 func TestForeignWarehouseIdentityRejectsExistingPendingAttemptAndReleasesProposal(t *testing.T) {
 	store := memory.NewProposalStore()
 	warehouse := newWarehouseFake()
