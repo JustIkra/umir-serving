@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -132,5 +133,15 @@ func TestServerErrorLogKeepsOnlyAKind(t *testing.T) {
 		if !strings.Contains(out.String(), `"kind":"`+kind+`"`) || strings.Contains(out.String(), "203.0.113.9") {
 			t.Fatalf("%q: %s", message, out.String())
 		}
+	}
+}
+
+func TestHealthcheckIgnoresInvalidInstanceID(t *testing.T) {
+	t.Setenv("SERVING_INSTANCE_ID", "bad id!")
+	if _, err := processLogger([]string{"server", "healthcheck"}, io.Discard); err != nil {
+		t.Fatalf("healthcheck must not depend on SERVING_INSTANCE_ID: %v", err)
+	}
+	if _, err := processLogger([]string{"server"}, io.Discard); err == nil {
+		t.Fatal("the server must still reject an invalid SERVING_INSTANCE_ID")
 	}
 }
