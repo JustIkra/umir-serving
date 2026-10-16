@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -21,7 +22,25 @@ import (
 
 const maxResponseBytes = 16 << 20
 
+// EventProtocolError is the event written when a Warehouse reply is invalid.
+const EventProtocolError = "warehouse.protocol_error"
+
+func (c *Client) logger() *slog.Logger {
+	if c.log == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return c.log
+}
+
+// WithLogger sets the logger of the client and returns it. Call it while
+// assembling the client; a nil logger discards.
+func (c *Client) WithLogger(logger *slog.Logger) *Client {
+	c.log = logger
+	return c
+}
+
 type Client struct {
+	log     *slog.Logger
 	scoped  *ScopedOptions
 	baseURL string
 	http    *http.Client
@@ -34,7 +53,7 @@ var _ contract.MenuWarehouse = (*Client)(nil)
 var _ contract.OrderAttemptReader = (*Client)(nil)
 
 func NewHTTPClient() *http.Client {
-	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: time.Second}
+	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: 64, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: time.Second}
 	return &http.Client{Transport: transport}
 }
 
@@ -63,17 +82,17 @@ func (c *Client) GetProducts(ctx context.Context) (contract.Products, error) {
 	}
 	evaluatedAt, err := c.parseTimestamp(response.EvaluatedAt)
 	if err != nil {
-		return contract.Products{}, protocolError(err)
+		return contract.Products{}, c.protocolFailure(ctx, err)
 	}
 	version, err := parseInt64(response.StateVersion, false)
 	if err != nil || response.Items == nil {
-		return contract.Products{}, protocolError(errors.New("invalid products payload"))
+		return contract.Products{}, c.protocolFailure(ctx, errors.New("invalid products payload"))
 	}
 	result := contract.Products{EvaluatedAt: evaluatedAt, StateVersion: version, Items: make([]contract.Product, len(response.Items))}
 	for index, item := range response.Items {
 		result.Items[index], err = productFromWire(item)
 		if err != nil {
-			return contract.Products{}, protocolError(err)
+			return contract.Products{}, c.protocolFailure(ctx, err)
 		}
 	}
 	return result, nil
@@ -90,17 +109,17 @@ func (c *Client) GetDishCatalog(ctx context.Context) (contract.DishCatalog, erro
 	}
 	evaluatedAt, err := c.parseTimestamp(response.EvaluatedAt)
 	if err != nil {
-		return contract.DishCatalog{}, protocolError(err)
+		return contract.DishCatalog{}, c.protocolFailure(ctx, err)
 	}
 	version, err := parseInt64(response.StateVersion, false)
 	if err != nil || response.Items == nil {
-		return contract.DishCatalog{}, protocolError(errors.New("invalid dish catalog payload"))
+		return contract.DishCatalog{}, c.protocolFailure(ctx, errors.New("invalid dish catalog payload"))
 	}
 	result := contract.DishCatalog{EvaluatedAt: evaluatedAt, StateVersion: version, Items: make([]contract.Dish, len(response.Items))}
 	for index, item := range response.Items {
 		result.Items[index], err = dishFromWire(item)
 		if err != nil {
-			return contract.DishCatalog{}, protocolError(err)
+			return contract.DishCatalog{}, c.protocolFailure(ctx, err)
 		}
 	}
 	return result, nil
@@ -121,18 +140,18 @@ func (c *Client) GetDish(ctx context.Context, dishID string) (contract.DishDetai
 	}
 	evaluatedAt, err := c.parseTimestamp(response.EvaluatedAt)
 	if err != nil {
-		return contract.DishDetails{}, protocolError(err)
+		return contract.DishDetails{}, c.protocolFailure(ctx, err)
 	}
 	version, err := parseInt64(response.StateVersion, false)
 	if err != nil {
-		return contract.DishDetails{}, protocolError(err)
+		return contract.DishDetails{}, c.protocolFailure(ctx, err)
 	}
 	dish, err := dishFromWire(response.Dish)
 	if err != nil {
-		return contract.DishDetails{}, protocolError(err)
+		return contract.DishDetails{}, c.protocolFailure(ctx, err)
 	}
 	if dish.DishID != dishID {
-		return contract.DishDetails{}, protocolError(errors.New("dish details identity does not match query"))
+		return contract.DishDetails{}, c.protocolFailure(ctx, errors.New("dish details identity does not match query"))
 	}
 	return contract.DishDetails{EvaluatedAt: evaluatedAt, StateVersion: version, Dish: dish}, nil
 }
@@ -150,10 +169,10 @@ func (c *Client) RegisterProduct(ctx context.Context, request contract.RegisterP
 	}
 	value, err := productFromWire(response)
 	if err != nil {
-		return contract.Product{}, protocolError(err)
+		return contract.Product{}, c.protocolFailure(ctx, err)
 	}
 	if value.ProductID != request.ProductID {
-		return contract.Product{}, protocolError(errors.New("registered product identity does not match request"))
+		return contract.Product{}, c.protocolFailure(ctx, errors.New("registered product identity does not match request"))
 	}
 	return value, nil
 }
@@ -175,10 +194,10 @@ func (c *Client) DefineDish(ctx context.Context, request contract.DefineDishRequ
 	}
 	value, err := dishFromWire(response)
 	if err != nil {
-		return contract.Dish{}, protocolError(err)
+		return contract.Dish{}, c.protocolFailure(ctx, err)
 	}
 	if value.DishID != request.DishID {
-		return contract.Dish{}, protocolError(errors.New("defined dish identity does not match request"))
+		return contract.Dish{}, c.protocolFailure(ctx, errors.New("defined dish identity does not match request"))
 	}
 	return value, nil
 }
@@ -188,7 +207,8 @@ func (c *Client) EvaluateMenu(ctx context.Context) (contract.MenuEvaluation, err
 	if err := c.get(ctx, "/menu-evaluation", nil, &response); err != nil {
 		return contract.MenuEvaluation{}, err
 	}
-	return c.menuFromWire(response)
+	menu, err := c.menuFromWire(response)
+	return menu, c.observeProtocolError(ctx, err)
 }
 
 func (c *Client) menuFromWire(response wireMenuEvaluation) (contract.MenuEvaluation, error) {
@@ -239,7 +259,7 @@ func (c *Client) EvaluateOrder(ctx context.Context, request contract.EvaluateOrd
 	}
 	evaluation, err := evaluationFromWire(response, c.parseTimestamp)
 	if err != nil {
-		return contract.OrderEvaluation{}, protocolError(err)
+		return contract.OrderEvaluation{}, c.protocolFailure(ctx, err)
 	}
 	return evaluation, nil
 }
@@ -261,10 +281,10 @@ func (c *Client) CommitAcceptedOrder(ctx context.Context, request contract.Commi
 	}
 	result, err := commitResultFromWire(response, c.parseTimestamp)
 	if err != nil {
-		return contract.CommitResult{}, protocolError(err)
+		return contract.CommitResult{}, c.protocolFailure(ctx, err)
 	}
 	if result.Kind == contract.OrderCommitted && (result.Order == nil || result.Order.ProposalID != request.ProposalID || !samePositions(result.Order.Positions, request.AcceptedPositions)) {
-		return contract.CommitResult{}, protocolError(errors.New("committed order does not match command input"))
+		return contract.CommitResult{}, c.protocolFailure(ctx, errors.New("committed order does not match command input"))
 	}
 	return result, nil
 }
@@ -281,24 +301,24 @@ func (c *Client) FindRecordedCommand(ctx context.Context, commandID string) (con
 		return contract.CommandRecord{}, false, err
 	}
 	if response.Found == nil {
-		return contract.CommandRecord{}, false, protocolError(errors.New("found discriminator is required"))
+		return contract.CommandRecord{}, false, c.protocolFailure(ctx, errors.New("found discriminator is required"))
 	}
 	if !*response.Found {
 		if response.Record != nil {
-			return contract.CommandRecord{}, false, protocolError(errors.New("record present when found is false"))
+			return contract.CommandRecord{}, false, c.protocolFailure(ctx, errors.New("record present when found is false"))
 		}
 		return contract.CommandRecord{}, false, nil
 	}
 	if response.Record == nil {
-		return contract.CommandRecord{}, false, protocolError(errors.New("record missing when found is true"))
+		return contract.CommandRecord{}, false, c.protocolFailure(ctx, errors.New("record missing when found is true"))
 	}
 	result, err := commandResultFromWire(response.Record.Result, c.parseTimestamp)
 	if err != nil {
-		return contract.CommandRecord{}, false, protocolError(err)
+		return contract.CommandRecord{}, false, c.protocolFailure(ctx, err)
 	}
 	record := contract.CommandRecord{CommandID: response.Record.CommandID, CommandType: response.Record.CommandType, CommandFingerprint: response.Record.CommandFingerprint, Result: result}
 	if record.CommandID == "" || record.CommandType == "" || record.CommandFingerprint == "" {
-		return contract.CommandRecord{}, false, protocolError(errors.New("invalid command record"))
+		return contract.CommandRecord{}, false, c.protocolFailure(ctx, errors.New("invalid command record"))
 	}
 	return record, true, nil
 }
@@ -324,23 +344,23 @@ func (c *Client) findOrder(ctx context.Context, key, id string) (contract.Order,
 		return contract.Order{}, false, err
 	}
 	if response.Found == nil {
-		return contract.Order{}, false, protocolError(errors.New("found discriminator is required"))
+		return contract.Order{}, false, c.protocolFailure(ctx, errors.New("found discriminator is required"))
 	}
 	if !*response.Found {
 		if response.Order != nil {
-			return contract.Order{}, false, protocolError(errors.New("order present when found is false"))
+			return contract.Order{}, false, c.protocolFailure(ctx, errors.New("order present when found is false"))
 		}
 		return contract.Order{}, false, nil
 	}
 	if response.Order == nil {
-		return contract.Order{}, false, protocolError(errors.New("order missing when found is true"))
+		return contract.Order{}, false, c.protocolFailure(ctx, errors.New("order missing when found is true"))
 	}
 	order, err := orderFromWire(*response.Order, c.parseTimestamp)
 	if err != nil {
-		return contract.Order{}, false, protocolError(err)
+		return contract.Order{}, false, c.protocolFailure(ctx, err)
 	}
 	if key == "orderID" && order.OrderID != id {
-		return contract.Order{}, false, protocolError(errors.New("order identity differs from query"))
+		return contract.Order{}, false, c.protocolFailure(ctx, errors.New("order identity differs from query"))
 	}
 	return order, true, nil
 }
@@ -361,24 +381,24 @@ func (c *Client) FindOrderAttempt(ctx context.Context, commandID, proposalID str
 	switch response.State {
 	case contract.OrderAttemptUnseen, contract.OrderAttemptPending:
 		if response.Result != nil || response.Error != nil {
-			return contract.OrderAttempt{}, protocolError(errors.New("inactive attempt payload"))
+			return contract.OrderAttempt{}, c.protocolFailure(ctx, errors.New("inactive attempt payload"))
 		}
 	case contract.OrderAttemptCompleted:
 		if response.Result == nil || response.Error != nil {
-			return contract.OrderAttempt{}, protocolError(errors.New("invalid completed attempt payload"))
+			return contract.OrderAttempt{}, c.protocolFailure(ctx, errors.New("invalid completed attempt payload"))
 		}
 		parsed, err := commitResultFromWire(*response.Result, c.parseTimestamp)
 		if err != nil || parsed.Kind == contract.CommitPending {
-			return contract.OrderAttempt{}, protocolError(errors.New("invalid completed result"))
+			return contract.OrderAttempt{}, c.protocolFailure(ctx, errors.New("invalid completed result"))
 		}
 		result.Result = &parsed
 	case contract.OrderAttemptRejected:
 		if response.Error == nil || response.Result != nil || (response.Error.Code == "" || c.scoped == nil && !knownAttemptErrorCode(response.Error.Code)) || response.Error.Message == "" || response.Error.Outcome != "not_committed" {
-			return contract.OrderAttempt{}, protocolError(errors.New("invalid rejected attempt payload"))
+			return contract.OrderAttempt{}, c.protocolFailure(ctx, errors.New("invalid rejected attempt payload"))
 		}
 		result.Error = &contract.AttemptError{Code: response.Error.Code, Message: response.Error.Message, Outcome: response.Error.Outcome}
 	default:
-		return contract.OrderAttempt{}, protocolError(fmt.Errorf("unknown attempt state %q", response.State))
+		return contract.OrderAttempt{}, c.protocolFailure(ctx, fmt.Errorf("unknown attempt state %q", response.State))
 	}
 	return result, nil
 }
@@ -430,7 +450,7 @@ func (c *Client) request(ctx context.Context, method, path string, query url.Val
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
 		if err != nil {
-			return protocolError(err)
+			return c.protocolFailure(ctx, err)
 		}
 		if c.scoped != nil && len(encoded) > 1<<20 {
 			return &contract.OperationError{Code: "InvalidArgument", Message: "warehouse request exceeds 1 MiB", Outcome: "not_committed", Cause: contract.ErrInvalidArgument}
@@ -439,7 +459,7 @@ func (c *Client) request(ctx context.Context, method, path string, query url.Val
 	}
 	request, err := http.NewRequestWithContext(requestContext, method, endpoint, body)
 	if err != nil {
-		return protocolError(err)
+		return c.protocolFailure(ctx, err)
 	}
 	if payload != nil {
 		request.Header.Set("Content-Type", "application/json")
@@ -498,7 +518,7 @@ func (c *Client) request(ctx context.Context, method, path string, query url.Val
 	}
 	if response.StatusCode == http.StatusAccepted {
 		if method != http.MethodPost || path != "/order-commits" || output == nil {
-			return protocolError(errors.New("unexpected 202 response"))
+			return c.protocolFailure(ctx, errors.New("unexpected 202 response"))
 		}
 	}
 	if err := requireJSON(response.Header.Get("Content-Type")); err != nil {
@@ -513,13 +533,13 @@ func (c *Client) request(ctx context.Context, method, path string, query url.Val
 	if method == http.MethodPost && path == "/order-commits" {
 		commit, ok := output.(*wireCommitResult)
 		if !ok {
-			return protocolError(errors.New("invalid commit decoder"))
+			return c.protocolFailure(ctx, errors.New("invalid commit decoder"))
 		}
 		if response.StatusCode == http.StatusAccepted && commit.Kind != contract.CommitPending {
-			return protocolError(errors.New("202 requires Pending result"))
+			return c.protocolFailure(ctx, errors.New("202 requires Pending result"))
 		}
 		if response.StatusCode == http.StatusOK && commit.Kind == contract.CommitPending {
-			return protocolError(errors.New("pending requires HTTP 202 status"))
+			return c.protocolFailure(ctx, errors.New("pending requires HTTP 202 status"))
 		}
 	}
 	return nil
@@ -639,6 +659,35 @@ func samePositions(left, right []contract.AcceptedPosition) bool {
 		}
 	}
 	return true
+}
+
+// protocolError builds the ProtocolError of an invalid Warehouse reply and
+// records warehouse.protocol_error. The record names the restaurant, the public
+// operation and the expected epoch, not the reply or the cause text.
+func (c *Client) protocolFailure(ctx context.Context, err error) error {
+	c.logProtocolError(ctx)
+	return protocolError(err)
+}
+
+// observeProtocolError records warehouse.protocol_error for an error returned by
+// a helper that builds ProtocolError without logging, and returns it unchanged.
+func (c *Client) observeProtocolError(ctx context.Context, err error) error {
+	var operation *contract.OperationError
+	if errors.As(err, &operation) && operation.Code == "ProtocolError" {
+		c.logProtocolError(ctx)
+	}
+	return err
+}
+
+func (c *Client) logProtocolError(ctx context.Context) {
+	attrs := []slog.Attr{slog.String("event", EventProtocolError), slog.String("error_code", "ProtocolError")}
+	if scope, ok := contract.RequestScopeFromContext(ctx); ok {
+		attrs = append(attrs, slog.String("operation", scope.Operation))
+	}
+	if c.scoped != nil {
+		attrs = append(attrs, slog.String("tenant_id", c.scoped.TenantID), slog.String("warehouse_epoch", c.scoped.Epoch))
+	}
+	c.logger().LogAttrs(context.WithoutCancel(ctx), slog.LevelError, EventProtocolError, attrs...)
 }
 
 func protocolError(err error) error {

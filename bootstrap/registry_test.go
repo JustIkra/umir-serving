@@ -300,3 +300,101 @@ func TestS1EveryRuntimeMethodRejectsMissingForeignAndInsufficientScope(t *testin
 		t.Fatal("menu grant escalated into order preparation")
 	}
 }
+
+func newReconcileRegistry(t *testing.T) *Registry {
+	t.Helper()
+	registry, err := NewRegistry(RegistryOptions{Epoch: epochA, Now: time.Now, NewID: func() string { return "p" }, WarehouseFactory: func(context.Context, string) (WarehousePorts, error) {
+		w := &warehouseStub{}
+		return WarehousePorts{Orders: w, Catalog: w, Menu: w, Epoch: peerEpoch}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := contract.RestaurantRegistration{OrgID: orgA, TenantID: tenantA, OperationID: operationA, ExpectedEpoch: epochA, LifecycleVersion: "1", TimeZone: "Europe/Moscow", SettingsVersion: "1"}
+	if err = registry.Register(t.Context(), registration); err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}
+
+func reconcileEntry(tenant, lifecycle string) contract.RegistryRestaurant {
+	return contract.RegistryRestaurant{OrgID: orgA, TenantID: tenant, LifecycleVersion: "1", Lifecycle: lifecycle}
+}
+
+func TestReconcileKeepsReadyWhileAnotherRestaurantIsRegistering(t *testing.T) {
+	registry := newReconcileRegistry(t)
+	if registry.Status().Ready {
+		t.Fatal("registry ready before the first complete reconciliation")
+	}
+	if err := registry.Reconcile(t.Context(), contract.RegistrySnapshot{Revision: "1", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "ready")}}); err != nil {
+		t.Fatal(err)
+	}
+	if !registry.Status().Ready {
+		t.Fatal("registry not ready after the first complete reconciliation")
+	}
+	// Auth lists a restaurant that is still registering and not installed here yet.
+	snapshot := contract.RegistrySnapshot{Revision: "2", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "ready"), reconcileEntry(tenantB, "registering")}}
+	if err := registry.Reconcile(t.Context(), snapshot); err != nil {
+		t.Fatalf("registering restaurant without local install failed reconciliation: %v", err)
+	}
+	if !registry.Status().Ready {
+		t.Fatal("registering restaurant without local install closed process readiness")
+	}
+	_, _, err := registry.Resolve(t.Context(), contract.RequestScope{OrgID: orgA, TenantID: tenantB, LifecycleVersion: "1"})
+	s3Code(t, err, "RuntimeNotReady", "unavailable")
+	if _, _, err = registry.Resolve(t.Context(), contract.RequestScope{OrgID: orgA, TenantID: tenantA, LifecycleVersion: "1"}); err != nil {
+		t.Fatalf("neighbor restaurant stopped working: %v", err)
+	}
+	// The skipped entry still advanced the revision: revision 1 is now a rollback.
+	if err = registry.Reconcile(t.Context(), contract.RegistrySnapshot{Revision: "1", Complete: true, Entries: snapshot.Entries}); err == nil || registry.Status().Ready {
+		t.Fatalf("revision rollback after a skipped registering entry: err=%v ready=%v", err, registry.Status().Ready)
+	}
+	snapshot.Revision = "3"
+	if err = registry.Reconcile(t.Context(), snapshot); err != nil || !registry.Status().Ready {
+		t.Fatalf("newer revision after a rollback: err=%v ready=%v", err, registry.Status().Ready)
+	}
+}
+
+func TestReconcileRegisteringForLocallyClosedRestaurantIsNotReady(t *testing.T) {
+	registry := newReconcileRegistry(t)
+	if err := registry.Reconcile(t.Context(), contract.RegistrySnapshot{Revision: "1", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "ready")}}); err != nil {
+		t.Fatal(err)
+	}
+	closeRequest := contract.RestaurantRegistration{OrgID: orgA, TenantID: tenantA, OperationID: operationA, ExpectedEpoch: epochA, LifecycleVersion: "2"}
+	if err := registry.Close(t.Context(), closeRequest); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := contract.RegistrySnapshot{Revision: "2", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "registering")}}
+	if err := registry.Reconcile(t.Context(), snapshot); err == nil {
+		t.Fatal("registering entry for a locally closed restaurant was skipped")
+	}
+	if registry.Status().Ready {
+		t.Fatal("registry stayed ready")
+	}
+}
+
+func TestReconcileStillRequiresProcessReadinessFacts(t *testing.T) {
+	first := contract.RegistrySnapshot{Revision: "5", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "ready")}}
+	cases := map[string]contract.RegistrySnapshot{
+		"incomplete":                   {Revision: "6", Complete: false, Entries: first.Entries},
+		"revision rollback":            {Revision: "4", Complete: true, Entries: first.Entries},
+		"ready without local install":  {Revision: "6", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "ready"), reconcileEntry(tenantB, "ready")}},
+		"registering other version":    {Revision: "6", Complete: true, Entries: []contract.RegistryRestaurant{{OrgID: orgA, TenantID: tenantA, LifecycleVersion: "2", Lifecycle: "registering"}}},
+		"local restaurant missing":     {Revision: "6", Complete: true},
+		"invalid entry in the listing": {Revision: "6", Complete: true, Entries: []contract.RegistryRestaurant{reconcileEntry(tenantA, "ready"), {OrgID: "bad", TenantID: tenantB, LifecycleVersion: "1", Lifecycle: "registering"}}},
+	}
+	for name, snapshot := range cases {
+		t.Run(name, func(t *testing.T) {
+			registry := newReconcileRegistry(t)
+			if err := registry.Reconcile(t.Context(), first); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.Reconcile(t.Context(), snapshot); err == nil {
+				t.Fatal("snapshot accepted")
+			}
+			if registry.Status().Ready {
+				t.Fatal("registry stayed ready")
+			}
+		})
+	}
+}

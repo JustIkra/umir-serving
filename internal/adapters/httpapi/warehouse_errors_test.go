@@ -41,3 +41,23 @@ func TestS2WarehouseRefusalStatusPreserved(t *testing.T) {
 		})
 	}
 }
+
+// The public v2 Error.code enum has CommandConflict and no
+// CommandIdentityConflict; a Serving-side identity conflict must use it.
+func TestServingCommandIdentityConflictIsEmittedAsCommandConflict(t *testing.T) {
+	for _, scoped := range []bool{true, false} {
+		handler := &Handler{scopedErrors: scoped}
+		response := httptest.NewRecorder()
+		handler.writeError(response, contract.ErrCommandIdentityConflict, true)
+		var body struct {
+			Code    string `json:"code"`
+			Outcome string `json:"outcome"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != 409 || body.Code != "CommandConflict" || body.Outcome != "not_committed" {
+			t.Fatalf("scoped=%v: HTTP %d %+v", scoped, response.Code, body)
+		}
+	}
+}

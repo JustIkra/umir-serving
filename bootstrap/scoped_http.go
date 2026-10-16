@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -27,6 +28,8 @@ type ScopedHTTPOptions struct {
 	RequestTimeout  time.Duration
 	MaxRequestBytes int64
 	Now             func() time.Time
+	// Logger receives HTTP response failures. Nil uses the registry logger.
+	Logger *slog.Logger
 }
 
 type scopedRegistryResolver struct{ registry *Registry }
@@ -69,7 +72,11 @@ func NewScopedHTTP(options ScopedHTTPOptions) (http.Handler, error) {
 	if options.Registry == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return httpapi.NewScopedHandler(scopedRegistryResolver{registry: options.Registry}, options.Verifier, httpapi.ScopedOptions{Options: httpapi.Options{RequestTimeout: options.RequestTimeout, MaxRequestBytes: options.MaxRequestBytes}, GatewayKey: options.GatewayKey, AuthKey: options.AuthKey, TZDataVersion: options.TZDataVersion, Now: options.Now})
+	logger := options.Logger
+	if logger == nil {
+		logger = options.Registry.log
+	}
+	return httpapi.NewScopedHandler(scopedRegistryResolver{registry: options.Registry}, options.Verifier, httpapi.ScopedOptions{Options: httpapi.Options{RequestTimeout: options.RequestTimeout, MaxRequestBytes: options.MaxRequestBytes, Logger: logger}, GatewayKey: options.GatewayKey, AuthKey: options.AuthKey, TZDataVersion: options.TZDataVersion, Now: options.Now})
 }
 
 func (r scopedRegistryResolver) Register(ctx context.Context, request contract.RestaurantRegistration) (contract.RuntimeReadiness, error) {

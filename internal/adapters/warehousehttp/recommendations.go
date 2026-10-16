@@ -71,7 +71,8 @@ func (c *Client) RecommendationInputs(ctx context.Context) (contract.Recommendat
 	if err := c.get(ctx, "/recommendation-inputs", nil, &wire); err != nil {
 		return contract.RecommendationInputs{}, err
 	}
-	return c.recommendationInputsFromWire(wire)
+	inputs, err := c.recommendationInputsFromWire(wire)
+	return inputs, c.observeProtocolError(ctx, err)
 }
 
 func (c *Client) recommendationInputsFromWire(v wireRecommendationInputs) (contract.RecommendationInputs, error) {

@@ -10,24 +10,50 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/JustIkra/umir-serving/contract"
 	"github.com/JustIkra/umir-serving/internal/adapters/httpjson"
 )
 
+const (
+	// keyTTL is how long a loaded key set may verify tokens; after it the
+	// client fails closed until a refresh succeeds.
+	keyTTL = 30 * time.Second
+	// keyRefreshAhead starts a background refresh while the cached keys are
+	// still valid, so verification does not wait for the network at expiry.
+	keyRefreshAhead = 20 * time.Second
+)
+
+// Client reads Auth discovery. Token verification reads the cached key set
+// under a read lock; the network call of a refresh runs outside the lock in
+// one goroutine shared by all callers, owned by the client and ended by Close.
 type Client struct {
-	baseURL     string
-	key         string
-	http        *http.Client
-	timeout     time.Duration
-	now         func() time.Time
-	retryNow    func() time.Time
-	keyGate     chan struct{}
+	baseURL  string
+	key      string
+	http     *http.Client
+	timeout  time.Duration
+	now      func() time.Time
+	retryNow func() time.Time
+
+	base context.Context
+	stop context.CancelFunc
+	wg   sync.WaitGroup
+
+	mu          sync.RWMutex
+	closed      bool
+	inflight    *refresh
 	keys        map[string]ed25519.PublicKey
 	loadedAt    time.Time
 	attemptedAt time.Time
 	unknown     map[string]bool
+}
+
+// refresh is one running JWKS fetch; done is closed after err is set.
+type refresh struct {
+	done chan struct{}
+	err  error
 }
 
 func New(baseURL, key string, client *http.Client, timeout time.Duration, now func() time.Time) (*Client, error) {
@@ -41,8 +67,20 @@ func NewWithRetryClock(baseURL, key string, client *http.Client, timeout time.Du
 	}
 	copyClient := *client
 	copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{baseURL: baseURL, key: key, http: &copyClient, timeout: timeout, now: now, retryNow: retryNow, unknown: make(map[string]bool), keyGate: make(chan struct{}, 1)}, nil
+	base, stop := context.WithCancel(context.Background())
+	return &Client{baseURL: baseURL, key: key, http: &copyClient, timeout: timeout, now: now, retryNow: retryNow, unknown: make(map[string]bool), base: base, stop: stop}, nil
 }
+
+// Close cancels a running key refresh and waits for it to end. Later calls
+// that need the network fail as unavailable.
+func (c *Client) Close() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.stop()
+	c.wg.Wait()
+}
+
 func unavailable(cause error) error {
 	return &contract.OperationError{Code: "AuthUnavailable", Message: "Auth discovery is unavailable", Outcome: "unavailable", Retryable: true, Cause: cause}
 }
@@ -87,17 +125,81 @@ type publicKey struct {
 	X         string `json:"x"`
 }
 
-func (c *Client) lockKeys(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return unavailable(err)
-	}
-	select {
-	case c.keyGate <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			<-c.keyGate
-			return unavailable(err)
+// fresh reports whether the loaded key set may still verify tokens at now.
+// A clock that moved before the load time makes the cache invalid.
+func (c *Client) fresh(now time.Time) bool {
+	return !c.loadedAt.IsZero() && !now.Before(c.loadedAt) && now.Sub(c.loadedAt) < keyTTL
+}
+
+func (c *Client) aging(now time.Time) bool { return now.Sub(c.loadedAt) >= keyRefreshAhead }
+
+// start launches the shared refresh goroutine; c.mu must be held for writing
+// and no refresh may be running. reset clears the unknown-kid memory when the
+// new key set is installed.
+func (c *Client) start(now time.Time, reset bool) *refresh {
+	c.attemptedAt = c.retryNow()
+	f := &refresh{done: make(chan struct{})}
+	c.inflight = f
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		keys, err := c.fetchKeys(c.base)
+		c.mu.Lock()
+		if err == nil {
+			c.keys = keys
+			c.loadedAt = now
+			if reset {
+				c.unknown = make(map[string]bool)
+			}
 		}
-		return nil
+		c.inflight = nil
+		f.err = err
+		c.mu.Unlock()
+		close(f.done)
+	}()
+	return f
+}
+
+// canStart reports why no refresh may begin. c.mu must be held.
+func (c *Client) canStart() error {
+	if c.closed {
+		return unavailable(errors.New("auth client is closed"))
+	}
+	if c.retryNow().IsZero() {
+		return unavailable(errors.New("invalid transport retry clock"))
+	}
+	return nil
+}
+
+// refreshAhead starts a background refresh of an aging but valid key set. It
+// is best effort: a failure leaves the cache to expire on its own. c.mu must
+// be held for writing.
+func (c *Client) refreshAhead(now time.Time) {
+	if c.inflight != nil || !c.aging(now) || c.retryPending() || c.canStart() != nil {
+		return
+	}
+	c.start(now, true)
+}
+
+// join returns the running refresh or starts one, throttled by the transport
+// retry clock. c.mu must be held for writing.
+func (c *Client) join(now time.Time, reset bool) (*refresh, error) {
+	if c.inflight != nil {
+		return c.inflight, nil
+	}
+	if !c.fresh(now) && c.retryPending() {
+		return nil, unavailable(errors.New("signing key refresh is pending"))
+	}
+	if err := c.canStart(); err != nil {
+		return nil, err
+	}
+	return c.start(now, reset), nil
+}
+
+func wait(ctx context.Context, f *refresh) error {
+	select {
+	case <-f.done:
+		return f.err
 	case <-ctx.Done():
 		return unavailable(ctx.Err())
 	}
@@ -107,33 +209,46 @@ func (c *Client) SigningKey(ctx context.Context, kid string) (ed25519.PublicKey,
 	if kid == "" || len(kid) > 256 {
 		return nil, unavailable(errors.New("invalid signing key identity"))
 	}
-	if err := c.lockKeys(ctx); err != nil {
-		return nil, err
+	if err := ctx.Err(); err != nil {
+		return nil, unavailable(err)
 	}
-	defer func() { <-c.keyGate }()
 	now := c.now()
 	if now.IsZero() {
 		return nil, unavailable(errors.New("invalid discovery clock"))
 	}
-	fresh := !c.loadedAt.IsZero() && !now.Before(c.loadedAt) && now.Sub(c.loadedAt) < 30*time.Second
+	c.mu.RLock()
+	if c.fresh(now) && !c.aging(now) {
+		if key, ok := c.keys[kid]; ok {
+			c.mu.RUnlock()
+			return append(ed25519.PublicKey(nil), key...), nil
+		}
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	fresh := c.fresh(now)
 	if fresh {
 		if key, ok := c.keys[kid]; ok {
+			c.refreshAhead(now)
+			c.mu.Unlock()
 			return append(ed25519.PublicKey(nil), key...), nil
 		}
 		if c.unknown[kid] || len(c.unknown) >= 256 {
+			c.mu.Unlock()
 			return nil, unavailable(errors.New("unknown signing key"))
 		}
 		c.unknown[kid] = true
 	}
-	if !fresh && c.retryPending() {
-		return nil, unavailable(errors.New("signing key refresh is pending"))
-	}
-	if err := c.refreshKeys(ctx, now); err != nil {
+	f, err := c.join(now, !fresh)
+	c.mu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	if !fresh {
-		c.unknown = make(map[string]bool)
+	if err = wait(ctx, f); err != nil {
+		return nil, err
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	key, ok := c.keys[kid]
 	if !ok {
 		c.unknown[kid] = true
@@ -142,34 +257,29 @@ func (c *Client) SigningKey(ctx context.Context, kid string) (ed25519.PublicKey,
 	return append(ed25519.PublicKey(nil), key...), nil
 }
 
-func (c *Client) refreshKeys(ctx context.Context, now time.Time) error {
-	retryNow := c.retryNow()
-	if retryNow.IsZero() {
-		return unavailable(errors.New("invalid transport retry clock"))
-	}
-	c.attemptedAt = retryNow
+func (c *Client) fetchKeys(ctx context.Context) (map[string]ed25519.PublicKey, error) {
 	var jwks struct {
 		Keys []publicKey `json:"keys"`
 	}
 	if err := c.get(ctx, "/internal/auth/v1/jwks", &jwks); err != nil {
-		return err
+		return nil, err
 	}
 	if len(jwks.Keys) < 1 || len(jwks.Keys) > 3 {
-		return unavailable(errors.New("invalid signing key set"))
+		return nil, unavailable(errors.New("invalid signing key set"))
 	}
 	keys := make(map[string]ed25519.PublicKey, len(jwks.Keys))
 	for _, k := range jwks.Keys {
 		bytes, err := base64.RawURLEncoding.Strict().DecodeString(k.X)
 		if err != nil || len(bytes) != ed25519.PublicKeySize || k.KeyType != "OKP" || k.Curve != "Ed25519" || k.Algorithm != "EdDSA" || k.Use != "sig" || strings.TrimSpace(k.ID) != k.ID || k.ID == "" || len(k.ID) > 256 || keys[k.ID] != nil {
-			return unavailable(errors.New("invalid Auth public signing key"))
+			return nil, unavailable(errors.New("invalid Auth public signing key"))
 		}
 		keys[k.ID] = ed25519.PublicKey(bytes)
 	}
-	c.keys = keys
-	c.loadedAt = now
-	return nil
+	return keys, nil
 }
 
+// retryPending bounds fetch attempts to one per second on the transport
+// clock. c.mu must be held for writing.
 func (c *Client) retryPending() bool {
 	if c.attemptedAt.IsZero() {
 		return false
@@ -185,25 +295,31 @@ func (c *Client) retryPending() bool {
 }
 
 func (c *Client) CheckSigningKeys(ctx context.Context) error {
-	if err := c.lockKeys(ctx); err != nil {
-		return err
+	if err := ctx.Err(); err != nil {
+		return unavailable(err)
 	}
-	defer func() { <-c.keyGate }()
 	now := c.now()
 	if now.IsZero() {
 		return unavailable(errors.New("invalid discovery clock"))
 	}
-	if !c.loadedAt.IsZero() && !now.Before(c.loadedAt) && now.Sub(c.loadedAt) < 30*time.Second {
+	c.mu.RLock()
+	ok := c.fresh(now) && !c.aging(now)
+	c.mu.RUnlock()
+	if ok {
 		return nil
 	}
-	if c.retryPending() {
-		return unavailable(errors.New("signing key refresh is pending"))
+	c.mu.Lock()
+	if c.fresh(now) {
+		c.refreshAhead(now)
+		c.mu.Unlock()
+		return nil
 	}
-	if err := c.refreshKeys(ctx, now); err != nil {
+	f, err := c.join(now, true)
+	c.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	c.unknown = make(map[string]bool)
-	return nil
+	return wait(ctx, f)
 }
 
 type Settings struct {

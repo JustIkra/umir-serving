@@ -16,10 +16,20 @@ const (
 )
 
 func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
+	trace := newConfirmTrace("confirm", request)
+	result, err := s.confirmWithAttemptsTraced(ctx, request, trace)
+	s.logConfirmOutcome(ctx, trace, result, err)
+	return result, err
+}
+
+func (s *OrdersService) confirmWithAttemptsTraced(ctx context.Context, request contract.ConfirmOrderRequest, trace *confirmTrace) (contract.ConfirmResult, error) {
 	if request.CommandID == "" || request.ProposalID == "" {
 		return contract.ConfirmResult{}, contract.ErrInvalidArgument
 	}
-	unlock := s.lockProposal(request.ProposalID)
+	unlock, err := s.lockProposal(ctx, request.ProposalID)
+	if err != nil {
+		return contract.ConfirmResult{}, err
+	}
 	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return contract.ConfirmResult{}, err
@@ -34,6 +44,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		return contract.ConfirmResult{}, err
 	}
 	if found {
+		trace.observeAttempt(attempt)
 		if err := requireSavedEpoch(ctx, attempt.Context); err != nil {
 			return contract.ConfirmResult{}, err
 		}
@@ -43,6 +54,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 			return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 		}
+		trace.markRetained(attempt)
 		if result, terminalErr, terminal := terminalAttempt(attempt); terminal {
 			contract.RecordWarehouseContext(ctx, result.Context)
 			return result, terminalErr
@@ -65,6 +77,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 	savedContext := contract.WarehouseContext{}
 	if scopeFound {
 		savedContext = attemptContext(ctx, proposalForScope.Proposal)
+		trace.observeSavedContext(savedContext)
 		if err := requireSavedEpoch(ctx, savedContext); err != nil {
 			return contract.ConfirmResult{}, err
 		}
@@ -167,6 +180,7 @@ func (s *OrdersService) confirmWithAttempts(ctx context.Context, request contrac
 		}
 		return contract.ConfirmResult{}, mapAttemptStoreError(err)
 	}
+	trace.reserved = true
 	attempt, _, err = s.attempts.GetAttempt(ctx, request.CommandID)
 	if err != nil {
 		return contract.ConfirmResult{}, err
@@ -323,6 +337,9 @@ func (s *OrdersService) completeRejectedAttempt(ctx context.Context, attempt con
 	if value.Outcome != "not_committed" {
 		return unknownCompletionError(errors.New("warehouse rejection outcome is not terminal"))
 	}
+	if value.Code == legacyCommandIdentityConflictCode {
+		value.Code = "CommandConflict"
+	}
 	completionContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), localCompletionBudget)
 	defer cancel()
 	if err := s.attempts.CompleteAttempt(completionContext, attempt.CommandID, contract.ConfirmResult{}, &value, nil); err != nil {
@@ -332,13 +349,23 @@ func (s *OrdersService) completeRejectedAttempt(ctx context.Context, attempt con
 }
 
 func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contract.ConfirmOrderRequest) (contract.ConfirmResult, error) {
+	trace := newConfirmTrace("resolve", request)
+	result, err := s.resolveConfirmation(ctx, request, trace)
+	s.logConfirmOutcome(ctx, trace, result, err)
+	return result, err
+}
+
+func (s *OrdersService) resolveConfirmation(ctx context.Context, request contract.ConfirmOrderRequest, trace *confirmTrace) (contract.ConfirmResult, error) {
 	if request.CommandID == "" || request.ProposalID == "" {
 		return contract.ConfirmResult{}, contract.ErrInvalidArgument
 	}
 	if s.attempts == nil || s.attemptReader == nil {
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	}
-	unlock := s.lockProposal(request.ProposalID)
+	unlock, err := s.lockProposal(ctx, request.ProposalID)
+	if err != nil {
+		return contract.ConfirmResult{}, err
+	}
 	defer unlock()
 	fingerprint, err := confirmOrderFingerprint(request.ProposalID)
 	if err != nil {
@@ -351,9 +378,11 @@ func (s *OrdersService) ResolveConfirmation(ctx context.Context, request contrac
 	if !found {
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	}
+	trace.observeAttempt(attempt)
 	if attempt.ProposalID != request.ProposalID || attempt.Fingerprint != fingerprint {
 		return contract.ConfirmResult{}, contract.ErrCommandIdentityConflict
 	}
+	trace.markRetained(attempt)
 	return s.resolveAttempt(ctx, request, attempt, false)
 }
 
@@ -382,10 +411,16 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 	if attempt.Context.Epoch != "" && capture.value.Epoch != "" && capture.value.Epoch != attempt.Context.Epoch {
 		return contract.ConfirmResult{}, &contract.OperationError{Code: "RuntimeReset", Outcome: "indeterminate"}
 	}
+	// Redelivery needs provenance from the owner attempt read itself; the
+	// /commands lookup below may record its own observation.
+	attemptObservation := capture.value
 	switch warehouseAttempt.State {
 	case contract.OrderAttemptUnseen:
 		if attempt.State == contract.OrderAttemptPending && attempt.Pending {
-			if retry && len(attempt.AcceptedPositions) > 0 && retryScopeMatches(ctx, attempt.Context, capture.value) {
+			if result, handled, err := s.finishFromRecordedCommand(ctx, attempt, capture); handled {
+				return result, err
+			}
+			if retry && len(attempt.AcceptedPositions) > 0 && retryScopeMatches(ctx, attempt.Context, attemptObservation) {
 				ctx = contract.WithWarehouseBinding(ctx, attempt.Context, false)
 				bounded, cancel := context.WithTimeout(ctx, retryCommitBudget)
 				defer cancel()
@@ -395,6 +430,9 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 		}
 		return contract.ConfirmResult{}, proposalNotFoundUnknown()
 	case contract.OrderAttemptPending:
+		if result, handled, err := s.finishFromRecordedCommand(ctx, attempt, capture); handled {
+			return result, err
+		}
 		return contract.ConfirmResult{Context: attempt.Context, Kind: contract.ConfirmationPending}, nil
 	case contract.OrderAttemptCompleted:
 		if warehouseAttempt.Result == nil || warehouseAttempt.Result.Kind == contract.CommitPending {
@@ -410,6 +448,33 @@ func (s *OrdersService) resolveAttempt(ctx context.Context, request contract.Con
 	default:
 		return contract.ConfirmResult{}, unknownLookupError(fmt.Errorf("unknown order attempt state %q", warehouseAttempt.State))
 	}
+}
+
+// finishFromRecordedCommand lets a retained attempt whose owner attempt is
+// Pending or Unseen look at /commands before it reports ConfirmationPending: the
+// owner may have recorded the order and lost the reply. handled is false only
+// when /commands has no record, so the caller keeps its own answer. It never
+// commits. A lookup failure is an unknown outcome and leaves the attempt as is.
+func (s *OrdersService) finishFromRecordedCommand(ctx context.Context, attempt contract.ConfirmationAttempt, capture *capturedWarehouse) (contract.ConfirmResult, bool, error) {
+	recorded, found, err := s.warehouse.FindRecordedCommand(ctx, attempt.CommandID)
+	if err != nil {
+		return contract.ConfirmResult{}, true, unknownLookupError(err)
+	}
+	if attempt.Context.Epoch != "" && capture.value.Epoch != "" && capture.value.Epoch != attempt.Context.Epoch {
+		return contract.ConfirmResult{}, true, &contract.OperationError{Code: "RuntimeReset", Outcome: "indeterminate"}
+	}
+	if !found {
+		return contract.ConfirmResult{}, false, nil
+	}
+	order, err := recordedOrder(recorded, attempt.CommandID, attempt.ProposalID, attempt.Fingerprint)
+	if err != nil {
+		if errors.Is(err, contract.ErrCommandIdentityConflict) {
+			return contract.ConfirmResult{}, true, s.finishKnownError(ctx, attempt, err)
+		}
+		return contract.ConfirmResult{}, true, unknownLookupError(err)
+	}
+	result, err := s.finishReadOrder(ctx, attempt, order, capture.value)
+	return result, true, err
 }
 
 func retryScopeMatches(ctx context.Context, saved, observed contract.WarehouseContext) bool {
@@ -435,17 +500,25 @@ func terminalAttempt(attempt contract.ConfirmationAttempt) (contract.ConfirmResu
 	return contract.ConfirmResult{}, nil, false
 }
 
+// legacyCommandIdentityConflictCode was written to stored attempts before the
+// public v2 code CommandConflict was adopted. It is only read, never written.
+const legacyCommandIdentityConflictCode = "CommandIdentityConflict"
+
 func attemptErrorFrom(err error) contract.AttemptError {
 	var remote *contract.OperationError
 	if errors.As(err, &remote) && remote.Outcome == "not_committed" {
-		return contract.AttemptError{Code: remote.Code, Message: remote.Message, Outcome: remote.Outcome}
+		code := remote.Code
+		if code == legacyCommandIdentityConflictCode {
+			code = "CommandConflict"
+		}
+		return contract.AttemptError{Code: code, Message: remote.Message, Outcome: remote.Outcome}
 	}
 	code := "InventoryUnavailable"
 	switch {
 	case errors.Is(err, contract.ErrInvalidArgument):
 		code = "InvalidArgument"
 	case errors.Is(err, contract.ErrCommandIdentityConflict):
-		code = "CommandIdentityConflict"
+		code = "CommandConflict"
 	case errors.Is(err, contract.ErrProductNotFound):
 		code = "ProductNotFound"
 	case errors.Is(err, contract.ErrDishNotFound):
@@ -463,8 +536,9 @@ func errorFromAttempt(value contract.AttemptError) error {
 		cause = contract.ErrInvalidArgument
 	case "InventoryUnavailable":
 		cause = contract.ErrInventoryUnavailable
-	case "CommandIdentityConflict":
+	case "CommandConflict", legacyCommandIdentityConflictCode: // the old code may exist in stored attempts
 		cause = contract.ErrCommandIdentityConflict
+		value.Code = "CommandConflict"
 	case "ProductNotFound":
 		cause = contract.ErrProductNotFound
 	case "DishNotFound":
