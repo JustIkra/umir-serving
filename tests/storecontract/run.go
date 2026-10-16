@@ -36,6 +36,10 @@ func Run(t *testing.T, newFixture Factory) {
 		{"ActiveProposalLimit", activeLimit},
 		{"RestaurantsAreIsolated", isolation},
 		{"CheckBookkeeping", checkBookkeeping},
+		{"RetentionKeepsPendingAndDeletesTheRest", retention},
+		{"RetentionRespectsTheBatchLimit", retentionLimit},
+		{"PickDueSelectsReservedAttemptsOnce", pickDue},
+		{"ParallelPickersDoNotOverlap", parallelPickers},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.run(t, newFixture) })
@@ -682,4 +686,203 @@ func acquire(t *testing.T, s Store, proposalID, holder string, ttl time.Duration
 		t.Fatalf("AcquireLease(%q): %v", proposalID, err)
 	}
 	return lease, ok
+}
+
+func proposalAt(id string, at time.Time) domain.OrderProposal {
+	p := proposalOf(id)
+	p.EvaluatedAt = at
+	return p
+}
+
+func terminal(t *testing.T, s Store, proposalID, commandID string) {
+	t.Helper()
+	reservePending(t, s, proposalID, commandID)
+	if err := s.CompleteAttempt(ctxBG(), commandID, contract.ConfirmResult{Kind: contract.EmptyOrder}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func sweepAll(t *testing.T, fx Fixture) application.SweepResult {
+	t.Helper()
+	var total application.SweepResult
+	for range 20 {
+		r, err := fx.Sweep(ctxBG(), 1000)
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		total.Proposals += r.Proposals
+		total.Attempts += r.Attempts
+		total.ClosedRestaurant += r.ClosedRestaurant
+		if r.Proposals+r.Attempts+r.ClosedRestaurant == 0 {
+			break
+		}
+	}
+	return total
+}
+
+func retention(t *testing.T, f Factory) {
+	fx := f(t, Options{})
+	s := fx.Store
+	now := fx.Now()
+	mustCreate(t, s, proposalAt("lonely", now))       // no attempt: 24 h
+	mustCreate(t, s, proposalAt("with-pending", now)) // pending attempt: never
+	mustCreate(t, s, proposalAt("with-done", now))    // terminal attempt: 30 days
+	mustCreate(t, s, proposalAt("with-unsent", now))  // attempt without a sent commit: 24 h
+	reservePending(t, s, "with-pending", "cmd-pending")
+	terminal(t, s, "with-done", "cmd-done")
+	if _, _, err := s.BeginAttempt(ctxBG(), fullAttempt("cmd-unsent", "with-unsent")); err != nil {
+		t.Fatal(err)
+	}
+	fx.Advance(23 * time.Hour)
+	sweepAll(t, fx)
+	if _, ok := getProposal(t, s, "lonely"); !ok {
+		t.Fatal("a proposal was deleted before 24 hours")
+	}
+	fx.Advance(2 * time.Hour) // 25 h
+	sweepAll(t, fx)
+	if _, ok := getProposal(t, s, "lonely"); ok {
+		t.Fatal("a proposal without an attempt survived 24 hours")
+	}
+	if _, ok := getAttempt(t, s, "cmd-unsent"); ok {
+		t.Fatal("an attempt without a sent commit survived 24 hours")
+	}
+	for _, id := range []string{"with-pending", "with-done", "with-unsent"} {
+		if _, ok := getProposal(t, s, id); !ok && id != "with-unsent" {
+			t.Fatalf("proposal %q with an attempt was deleted early", id)
+		}
+	}
+	if _, ok := getAttempt(t, s, "cmd-pending"); !ok {
+		t.Fatal("a pending attempt was deleted")
+	}
+	if _, ok := getAttempt(t, s, "cmd-done"); !ok {
+		t.Fatal("a terminal attempt was deleted before 30 days")
+	}
+	fx.Advance(28 * 24 * time.Hour) // 29 days
+	sweepAll(t, fx)
+	if _, ok := getAttempt(t, s, "cmd-done"); !ok {
+		t.Fatal("a terminal attempt was deleted before 30 days")
+	}
+	fx.Advance(2 * 24 * time.Hour) // 31 days
+	sweepAll(t, fx)
+	if _, ok := getAttempt(t, s, "cmd-done"); ok {
+		t.Fatal("a terminal attempt survived 30 days")
+	}
+	if _, ok := getProposal(t, s, "with-done"); ok {
+		t.Fatal("the proposal of a deleted terminal attempt survived")
+	}
+	// A pending attempt, even a very old one, is never deleted (C25).
+	fx.Advance(400 * 24 * time.Hour)
+	sweepAll(t, fx)
+	if a, ok := getAttempt(t, s, "cmd-pending"); !ok || !a.Pending {
+		t.Fatal("a pending attempt did not survive a year")
+	}
+	if _, ok := getProposal(t, s, "with-pending"); !ok {
+		t.Fatal("the proposal of a pending attempt was deleted")
+	}
+}
+
+func retentionLimit(t *testing.T, f Factory) {
+	fx := f(t, Options{})
+	now := fx.Now()
+	for i := range 5 {
+		mustCreate(t, fx.Store, proposalAt(fmt.Sprintf("old-%d", i), now))
+	}
+	fx.Advance(25 * time.Hour)
+	r, err := fx.Sweep(ctxBG(), 2)
+	if err != nil || r.Proposals != 2 {
+		t.Fatalf("Sweep(limit 2) = %+v, %v; want 2 proposals", r, err)
+	}
+	if r := sweepAll(t, fx); r.Proposals != 3 {
+		t.Fatalf("remaining sweep = %+v, want 3 proposals", r)
+	}
+}
+
+func pickDue(t *testing.T, f Factory) {
+	fx := f(t, Options{})
+	s := fx.Store
+	now := fx.Now()
+	for _, id := range []string{"p-due", "p-unreserved", "p-done", "p-unresolved"} {
+		mustCreate(t, s, proposalAt(id, now))
+	}
+	mustCreate(t, fx.Other, proposalAt("p-other", now))
+	reservePending(t, s, "p-due", "cmd-due")
+	reservePending(t, fx.Other, "p-other", "cmd-other")
+	reservePending(t, s, "p-unresolved", "cmd-unresolved")
+	if err := s.MarkUnresolved(ctxBG(), "cmd-unresolved"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.BeginAttempt(ctxBG(), fullAttempt("cmd-unreserved", "p-unreserved")); err != nil {
+		t.Fatal(err)
+	}
+	terminal(t, s, "p-done", "cmd-done")
+	due, err := fx.PickDue(ctxBG(), 10, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]application.DueAttempt{}
+	for _, d := range due {
+		got[d.CommandID] = d
+	}
+	if len(got) != 2 || got["cmd-due"].RestaurantID != fx.RestaurantID || got["cmd-due"].OrgID != fx.OrgID || got["cmd-other"].CommandID == "" || got["cmd-other"].RestaurantID == fx.RestaurantID {
+		t.Fatalf("picked %+v, want cmd-due and cmd-other with their own restaurants", due)
+	}
+	again, err := fx.PickDue(ctxBG(), 10, 5*time.Second)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("second pick = %+v, %v; the shift must hide picked rows", again, err)
+	}
+	fx.Advance(6 * time.Second)
+	later, err := fx.PickDue(ctxBG(), 10, 5*time.Second)
+	if err != nil || len(later) != 2 {
+		t.Fatalf("pick after the shift = %+v, %v; want both again", later, err)
+	}
+	// A backoff set by RecordCheck hides the attempt until it is due.
+	if err := s.RecordCheck(ctxBG(), "cmd-due", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	fx.Advance(10 * time.Second)
+	partial, err := fx.PickDue(ctxBG(), 10, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range partial {
+		if d.CommandID == "cmd-due" {
+			t.Fatal("an attempt was picked before its backoff ended")
+		}
+	}
+	if _, err := fx.PickDue(ctxBG(), 0, time.Second); err == nil {
+		t.Fatal("limit 0 was accepted")
+	}
+}
+
+func parallelPickers(t *testing.T, f Factory) {
+	fx := f(t, Options{})
+	now := fx.Now()
+	const n = 30
+	for i := range n {
+		mustCreate(t, fx.Store, proposalAt(fmt.Sprintf("p-%d", i), now))
+		reservePending(t, fx.Store, fmt.Sprintf("p-%d", i), fmt.Sprintf("c-%d", i))
+	}
+	var mu sync.Mutex
+	seen := map[string]int{}
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			due, err := fx.PickDue(ctxBG(), 10, time.Minute)
+			if err != nil {
+				t.Errorf("PickDue: %v", err)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, d := range due {
+				seen[d.CommandID]++
+			}
+		})
+	}
+	wg.Wait()
+	for id, count := range seen {
+		if count != 1 {
+			t.Fatalf("attempt %s was picked %d times", id, count)
+		}
+	}
 }

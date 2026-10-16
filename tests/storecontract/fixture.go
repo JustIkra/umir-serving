@@ -28,8 +28,10 @@ type Fixture struct {
 	Store   Store
 	Other   Store
 	Advance func(time.Duration)
+	// Now is the clock the storage uses.
+	Now func() time.Time
 	// Sweep runs one retention pass over the whole storage.
-	Sweep func(ctx context.Context) (application.SweepResult, error)
+	Sweep func(ctx context.Context, limit int) (application.SweepResult, error)
 	// PickDue is the reconciler selection over the whole storage.
 	PickDue func(ctx context.Context, limit int, shift time.Duration) ([]application.DueAttempt, error)
 	// OrgID and RestaurantID of Store, as the picker reports them.

@@ -55,6 +55,9 @@ func New(tb testing.TB) *Env {
 	if err := pgstore.Migrate(tb.Context(), owner); err != nil {
 		tb.Fatalf("migrate: %v", err)
 	}
+	// The runtime role reads the generation and the schema version and never
+	// writes them (reference doc.go); the default privileges gave it more.
+	env.Admin(tb, fmt.Sprintf("REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON storage_meta, schema_migrations FROM %s", pgx.Identifier{env.RuntimeRole}.Sanitize()))
 	return env
 }
 

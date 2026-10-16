@@ -36,7 +36,7 @@ CREATE TABLE serving_proposals (
     requested_positions jsonb       NOT NULL,
     accepted_positions  jsonb       NOT NULL,
     changes             jsonb       NOT NULL,
-    position_count      int         NOT NULL CHECK (position_count > 0),
+    position_count      int         NOT NULL CHECK (position_count >= 0),
     superseded_by       text,
     settled_at          timestamptz,
     lease_holder        text,

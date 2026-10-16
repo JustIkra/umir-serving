@@ -33,6 +33,8 @@ type ProposalStore struct {
 	maxActive int
 	proposals map[string]*proposalEntry
 	attempts  map[string]contract.ConfirmationAttempt
+	// org and restaurant are set when the store belongs to a Storage.
+	org, restaurant string
 }
 
 type proposalEntry struct {
@@ -399,4 +401,84 @@ func (s *ProposalStore) Get(ctx context.Context, proposalID string) (domain.Prop
 	record := entry.record
 	record.Proposal = record.Proposal.Clone()
 	return record, true, nil
+}
+
+const (
+	terminalRetention         = 30 * 24 * time.Hour
+	unsentRetention           = 24 * time.Hour
+	proposalRetention         = 24 * time.Hour
+	closedRestaurantRetention = 7 * 24 * time.Hour
+)
+
+type dueAttempt struct {
+	application.DueAttempt
+	dueAt time.Time
+}
+
+// pickDue returns the pending attempts whose check is due and moves their next
+// check forward by shift.
+func (s *ProposalStore) pickDue(now time.Time, shift time.Duration) []dueAttempt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var due []dueAttempt
+	for id, attempt := range s.attempts {
+		if !attempt.Pending || !attempt.UnresolvedAt.IsZero() || attempt.NextCheckAt.After(now) {
+			continue
+		}
+		due = append(due, dueAttempt{DueAttempt: application.DueAttempt{OrgID: s.org, RestaurantID: s.restaurant, CommandID: id}, dueAt: attempt.NextCheckAt})
+		attempt.NextCheckAt = now.Add(shift)
+		s.attempts[id] = attempt
+	}
+	return due
+}
+
+func (s *ProposalStore) restoreCheck(commandID string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if attempt, ok := s.attempts[commandID]; ok {
+		attempt.NextCheckAt = at
+		s.attempts[commandID] = attempt
+	}
+}
+
+// sweep deletes rows past their retention, at most limit per rule. With
+// closed set every row of the restaurant goes.
+func (s *ProposalStore) sweep(now time.Time, limit int, closed bool) application.SweepResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result application.SweepResult
+	removed := 0
+	for id, attempt := range s.attempts {
+		terminal := !attempt.Pending && (attempt.State == contract.OrderAttemptCompleted || attempt.State == contract.OrderAttemptRejected) && now.Sub(attempt.UpdatedAt) > terminalRetention
+		unsent := attempt.State == contract.OrderAttemptPending && !attempt.Pending && attempt.WarehouseResult == nil && now.Sub(attempt.UpdatedAt) > unsentRetention
+		switch {
+		case (terminal || unsent) && result.Attempts < limit:
+			delete(s.attempts, id)
+			result.Attempts++
+		case closed && removed < limit:
+			delete(s.attempts, id)
+			removed++
+		}
+	}
+	referenced := make(map[string]bool, len(s.attempts))
+	for _, attempt := range s.attempts {
+		referenced[attempt.ProposalID] = true
+	}
+	removedProposals := 0
+	for id, entry := range s.proposals {
+		if referenced[id] {
+			continue
+		}
+		expired := now.Sub(entry.record.Proposal.EvaluatedAt) > proposalRetention
+		switch {
+		case expired && result.Proposals < limit:
+			delete(s.proposals, id)
+			result.Proposals++
+		case closed && removedProposals < limit:
+			delete(s.proposals, id)
+			removedProposals++
+		}
+	}
+	result.ClosedRestaurant = removed + removedProposals
+	return result
 }
