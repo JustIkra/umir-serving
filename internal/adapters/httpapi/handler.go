@@ -278,6 +278,10 @@ func (h *Handler) prepareOrder(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, contract.ErrInvalidArgument, true)
 		return
 	}
+	if len(input.Positions) > contract.MaxOrderPositions {
+		h.writeError(w, contract.ErrInvalidArgument, true)
+		return
+	}
 	positions := make([]contract.Position, len(input.Positions))
 	for index, item := range input.Positions {
 		portions, err := parsePositiveInt64(item.Portions)
@@ -307,7 +311,7 @@ func (h *Handler) confirm(w http.ResponseWriter, r *http.Request, resolve bool) 
 	if !decode(w, r, &input) {
 		return
 	}
-	if input.CommandID == "" || input.ProposalID == "" {
+	if !contract.ValidClientID(input.CommandID) || !contract.ValidClientID(input.ProposalID) {
 		if resolve {
 			h.writeErrorWithInvalidArgumentOutcome(w, contract.ErrInvalidArgument, true, "unknown")
 		} else {
@@ -470,6 +474,10 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 			value.Code = "CommandConflict"
 			value.Message = "command identity conflicts with an existing attempt"
 			value.Outcome = "not_committed"
+		case errors.Is(err, contract.ErrLimitExceeded):
+			value.Code = "LimitExceeded"
+			value.Message = "restaurant proposal limit reached"
+			value.Outcome = "not_committed"
 		case errors.Is(err, contract.ErrProposalNotFound):
 			value.Code = "ProposalNotFound"
 			value.Message = "proposal outcome is unknown"
@@ -521,8 +529,14 @@ func (h *Handler) writeErrorWithInvalidArgumentOutcome(w http.ResponseWriter, er
 		status = http.StatusGatewayTimeout
 	case "ScopeDeleted":
 		status = http.StatusGone
-	case "RateLimited", "LimitExceeded":
+	case "RateLimited":
 		status = http.StatusTooManyRequests
+	case "LimitExceeded":
+		if operation != nil && operation.Retryable {
+			status = http.StatusTooManyRequests
+		} else {
+			status = http.StatusConflict
+		}
 	case "ConfirmationPending":
 		status = http.StatusAccepted
 	}

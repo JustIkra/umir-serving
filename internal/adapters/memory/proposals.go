@@ -58,6 +58,7 @@ func WithMaxActiveProposals(limit int) Option { return func(s *ProposalStore) { 
 func NewProposalStore(options ...Option) *ProposalStore {
 	s := &ProposalStore{
 		now:       time.Now,
+		maxActive: contract.MaxActiveProposals,
 		proposals: make(map[string]*proposalEntry),
 		attempts:  make(map[string]contract.ConfirmationAttempt),
 	}

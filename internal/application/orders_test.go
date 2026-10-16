@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -134,6 +135,35 @@ func newWarehouseFake() *warehouseFake {
 	return &warehouseFake{
 		recorded:         make(map[string]contract.CommandRecord),
 		ordersByProposal: make(map[string]contract.Order),
+	}
+}
+
+func TestPrepareOrderRejectsPositionLimitBeforeWarehouse(t *testing.T) {
+	warehouse := newWarehouseFake()
+	service := newOrdersService(t, memory.NewProposalStore(), warehouse)
+	positions := make([]contract.Position, 201)
+	for index := range positions {
+		positions[index] = contract.Position{DishID: "dish-1", Portions: 1}
+	}
+	if _, err := service.PrepareOrder(context.Background(), contract.PrepareOrderRequest{Positions: positions}); !errors.Is(err, contract.ErrInvalidArgument) {
+		t.Fatalf("PrepareOrder() error = %v, want invalid argument", err)
+	}
+	if warehouse.evaluateCalls != 0 {
+		t.Fatalf("warehouse evaluations = %d, want 0", warehouse.evaluateCalls)
+	}
+}
+
+func TestPrepareOrderRejectsGeneratedProposalIDOverLimitBeforeWarehouse(t *testing.T) {
+	warehouse := newWarehouseFake()
+	service, err := application.NewOrdersService(memory.NewProposalStore(), warehouse, time.Now, func() string { return strings.Repeat("p", contract.MaxClientIDLength+1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.PrepareOrder(context.Background(), contract.PrepareOrderRequest{Positions: []contract.Position{{DishID: "dish-1", Portions: 1}}}); !errors.Is(err, contract.ErrInvalidArgument) {
+		t.Fatalf("PrepareOrder() error = %v, want invalid argument", err)
+	}
+	if warehouse.evaluateCalls != 0 {
+		t.Fatalf("warehouse evaluations = %d, want 0", warehouse.evaluateCalls)
 	}
 }
 

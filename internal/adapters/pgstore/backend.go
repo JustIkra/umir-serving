@@ -19,7 +19,7 @@ const (
 // Options tune the backend. Zero values are the production defaults.
 type Options struct {
 	// MaxActiveProposals caps unsettled proposals younger than 24 hours per
-	// restaurant (G1-5); zero means no cap.
+	// restaurant (G1-5); zero selects the approved default.
 	MaxActiveProposals int
 	// Clock replaces the database clock in tests; nil uses the database clock,
 	// the one time source of all replicas.
@@ -34,7 +34,12 @@ type Backend struct {
 }
 
 // New wraps an opened pool (runtime role).
-func New(db *postgres.DB, opts Options) *Backend { return &Backend{db: db, opts: opts} }
+func New(db *postgres.DB, opts Options) *Backend {
+	if opts.MaxActiveProposals <= 0 {
+		opts.MaxActiveProposals = contract.MaxActiveProposals
+	}
+	return &Backend{db: db, opts: opts}
+}
 
 // Store returns the storage of one restaurant.
 func (b *Backend) Store(orgID, restaurantID string) *Store {

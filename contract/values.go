@@ -362,6 +362,10 @@ type DishCatalog struct {
 // points (C43).
 const MaxClientIDLength = 256
 
+const MaxActiveProposals = 2000
+
+const MaxOrderPositions = 200
+
 // ValidClientID reports whether value is a usable command or proposal
 // identifier: valid UTF-8 of 1 to 256 code points.
 func ValidClientID(value string) bool {
